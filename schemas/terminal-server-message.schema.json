@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/gridshell-app/gridshell/main/schemas/terminal-server-message.schema.json",
+  "title": "GridShell /terminal server→client message",
+  "description": "Every message the server sends on the /terminal WebSocket. Discriminated by `type`. See README.md in this directory for what this schema does NOT cover (reattach/buffer-replay, evict-on-attach, idle-kill timing - behavioral guarantees, not message shapes).",
+  "oneOf": [
+    {
+      "title": "attached",
+      "description": "Sent immediately when this connection reattaches to an existing session. A fresh spawn sends `spawned` instead. If the session had buffered scrollback, an `output` message carrying the full replayed buffer follows immediately after.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "attached" }
+      },
+      "required": ["type"],
+      "additionalProperties": false
+    },
+    {
+      "title": "output",
+      "description": "Shell output. `data` may be live output as it's produced, or (immediately after `attached`, on reattach) the session's replayed scrollback buffer joined into one string.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "output" },
+        "data": { "type": "string" }
+      },
+      "required": ["type", "data"],
+      "additionalProperties": false
+    },
+    {
+      "title": "spawned",
+      "description": "Sent once, after the shell process has actually started, in response to the connection's first `resize` message.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "spawned" }
+      },
+      "required": ["type"],
+      "additionalProperties": false
+    },
+    {
+      "title": "resized",
+      "description": "Acknowledges a `resize` message sent against an already-spawned session - confirms the underlying process has actually been resized, so the client can safely reflow its own terminal emulator buffer without racing the resize. Never sent in response to the very first `resize` (that one triggers `spawned` instead).",
+      "type": "object",
+      "properties": {
+        "type": { "const": "resized" },
+        "cols": { "type": "integer", "minimum": 1 },
+        "rows": { "type": "integer", "minimum": 1 }
+      },
+      "required": ["type", "cols", "rows"],
+      "additionalProperties": false
+    },
+    {
+      "title": "warning",
+      "description": "A non-fatal problem with this session's setup - currently just a `cwd` that wasn't a usable directory on the server, so the shell started in the server's own default location instead. Sent once, right after `spawned`.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "warning" },
+        "message": { "type": "string" }
+      },
+      "required": ["type", "message"],
+      "additionalProperties": false
+    },
+    {
+      "title": "evicted",
+      "description": "Sent to a socket that was the session's live attachment, immediately before the server closes it, because a different connection just attached to the same session. At most one socket is ever attached to a session at a time (see README.md).",
+      "type": "object",
+      "properties": {
+        "type": { "const": "evicted" }
+      },
+      "required": ["type"],
+      "additionalProperties": false
+    },
+    {
+      "title": "terminated",
+      "description": "Sent in response to a client's `terminate` message, after the process has actually been killed and the session removed - confirms the kill happened rather than leaving the caller to assume it from having sent the request.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "terminated" }
+      },
+      "required": ["type"],
+      "additionalProperties": false
+    }
+  ]
+}

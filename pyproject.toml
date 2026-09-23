@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=77"]  # PEP 639 SPDX license string + license-files needs 77+
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gridshell"
+version = "1.0.0b1"
+description = "Self-hosted terminal-server + MCP relay + Python client for driving a live, open Google Sheets spreadsheet from an AI CLI agent or a script."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+keywords = ["google-sheets", "mcp", "terminal", "pty", "websocket", "ai-agent"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    # requires-python above is the actual floor - no per-version classifiers.
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+    "Topic :: Terminals",
+]
+dependencies = [
+    # legacy=True (transport.py) needs 17.1+ - didn't exist before that.
+    "websockets>=17.1,<18",
+    "pywinpty>=2.0; sys_platform == 'win32'",
+    "ptyprocess>=0.7; sys_platform != 'win32'",
+    "mcp>=2.1.1,<3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "jsonschema>=4.0"]
+
+[project.scripts]
+gridshell-server = "gridshell.server:run"
+gridshell-mcp = "gridshell.mcp_grid:run"
+
+[project.urls]
+Homepage = "https://gridshell.app"
+Documentation = "https://gridshell.app"
+Repository = "https://github.com/gridshell-app/gridshell"
+Issues = "https://github.com/gridshell-app/gridshell/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]

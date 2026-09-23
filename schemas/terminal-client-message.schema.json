@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/gridshell-app/gridshell/main/schemas/terminal-client-message.schema.json",
+  "title": "GridShell /terminal client→server message",
+  "description": "Every message a client sends on the /terminal WebSocket. Discriminated by `type`. See README.md in this directory for what this schema does NOT cover (reattach/buffer-replay, evict-on-attach, idle-kill timing - behavioral guarantees, not message shapes).",
+  "oneOf": [
+    {
+      "title": "resize",
+      "description": "Requests a terminal size. Sent once before the very first message on a fresh connection (triggers the initial shell spawn) and again on every subsequent resize. The server clamps cols/rows to a minimum of 1 rather than rejecting a smaller/invalid value.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "resize" },
+        "cols": { "type": "integer", "minimum": 1 },
+        "rows": { "type": "integer", "minimum": 1 }
+      },
+      "required": ["type", "cols", "rows"],
+      "additionalProperties": false
+    },
+    {
+      "title": "input",
+      "description": "Raw keystrokes/bytes to write to the shell's stdin, exactly as the terminal emulator (e.g. xterm.js) produced them - no line-based framing.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "input" },
+        "data": { "type": "string" }
+      },
+      "required": ["type", "data"],
+      "additionalProperties": false
+    },
+    {
+      "title": "terminate",
+      "description": "Kills the shell immediately and deletes the session, bypassing the idle-grace timer entirely. Distinct from simply closing the WebSocket, which only starts the idle-grace countdown (see README.md).",
+      "type": "object",
+      "properties": {
+        "type": { "const": "terminate" }
+      },
+      "required": ["type"],
+      "additionalProperties": false
+    }
+  ]
+}

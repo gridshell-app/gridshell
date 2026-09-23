@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/gridshell-app/gridshell/main/schemas/request-envelope.schema.json",
+  "title": "GridShell /host + /mcp request envelope",
+  "description": "Sent by an MCP client on /mcp; forwarded verbatim by server.py to the matching /host client (see README.md for how the session id routes it there). server.py never inspects `tool`/`params` - this envelope is tool-agnostic by design.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Caller-generated correlation id, unique per in-flight call. Echoed back verbatim on the matching response envelope."
+    },
+    "tool": {
+      "type": "string",
+      "description": "Tool name (e.g. \"runBatch\", \"getValues\") - a literal name, resolved app-side; server.py does not interpret it."
+    },
+    "params": {
+      "type": "object",
+      "description": "Tool-specific arguments, as a plain object. Defaults to {} if omitted."
+    },
+    "timeoutMs": {
+      "type": "number",
+      "exclusiveMinimum": 0,
+      "description": "How long server.py should wait for the /host client's response before giving up. Omitted or non-positive falls back to a 15000ms server-side default."
+    }
+  },
+  "required": ["id", "tool"],
+  "additionalProperties": false
+}

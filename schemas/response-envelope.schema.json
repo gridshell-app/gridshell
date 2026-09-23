@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/gridshell-app/gridshell/main/schemas/response-envelope.schema.json",
+  "title": "GridShell /host + /mcp response envelope",
+  "description": "Sent by a /host client in reply to a request-envelope message; forwarded verbatim by server.py back to the /mcp client that made the call. server.py also synthesizes an error envelope itself (never a success one) when no /host client is connected, or when the /host client doesn't reply before the request's timeoutMs elapses.",
+  "oneOf": [
+    {
+      "title": "success",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Matches the request envelope's `id`." },
+        "result": {
+          "description": "Tool-specific return value - any JSON type, including null for a call with no meaningful result (e.g. a plain write)."
+        }
+      },
+      "required": ["id", "result"],
+      "additionalProperties": false
+    },
+    {
+      "title": "error",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Matches the request envelope's `id`." },
+        "error": { "type": "string", "description": "Human-readable failure message." }
+      },
+      "required": ["id", "error"],
+      "additionalProperties": false
+    }
+  ]
+}
