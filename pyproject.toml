@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gridshell"
-version = "1.0.0b1"
+version = "1.0.0b2"
 description = "Self-hosted terminal-server + MCP relay + Python client for driving a live, open Google Sheets spreadsheet from an AI CLI agent or a script."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.10"
+requires-python = ">=3.11"  # websockets 17.x (below) needs 3.11+
 keywords = ["google-sheets", "mcp", "terminal", "pty", "websocket", "ai-agent"]
 classifiers = [
     "Development Status :: 4 - Beta",

@@ -8,7 +8,7 @@ Everything needed to self-host a [GridShell](https://gridshell.app) backend and 
 
 ## Requirements
 
-- Python 3.10+ (forced by the `mcp` SDK dependency, which has never supported below 3.10).
+- Python 3.11+ (forced by the `websockets` dependency, whose current releases don't support anything older).
 - The Sheets side wired up separately: this package doesn't include the Google Sheets add-on itself (Apps Script, installed via the Sheets sidebar) - only the backend it talks to.
 
 ## Install
