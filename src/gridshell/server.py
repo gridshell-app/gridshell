@@ -52,6 +52,7 @@ level, so running elevated hands that shell the same elevated privileges.
 """
 import asyncio
 import atexit
+import codecs
 import hmac
 import json
 import os
@@ -81,6 +82,13 @@ if sys.platform == "win32":
 else:
     # PtyProcessUnicode gives str in/out on read()/write(), matching pywinpty.
     from ptyprocess import PtyProcessUnicode as PtyProcess
+
+
+def _tolerate_invalid_utf8(proc):
+    # ptyprocess decodes strictly, so one invalid byte (e.g. `cat` on a binary
+    # file) would raise in the reader and end the session. pywinpty has no decoder.
+    if getattr(proc, "decoder", None) is not None:
+        proc.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
 # Matches CSI/OSC escape sequences, used to detect a chunk that's pure
 # terminal negotiation (device-attribute queries, title-setting), no real
@@ -221,6 +229,9 @@ class TerminalHub:
         # connection (see _effective_cap_for_doc). Resets on server restart,
         # same as self.sessions.
         self.doc_caps = {}
+        # Ids killed via "terminate". Never reused, so a later spawn under one
+        # is a stale dialog racing the kill.
+        self.terminated = set()
 
     def _sessions_for_doc(self, doc_id):
         return sum(1 for s in self.sessions.values() if s.get("doc_id", "") == doc_id)
@@ -374,6 +385,11 @@ class TerminalHub:
                     except RuntimeError:
                         pass
                 del self.sessions[key]
+                # An error exit leaves the process alive, kill it so it isn't orphaned.
+                try:
+                    proc.terminate(force=True)
+                except Exception:
+                    pass
                 log(log_prefix, "shell exited")
 
         def spawn_process():
@@ -400,6 +416,7 @@ class TerminalHub:
                 _spawn_argv(), cwd=spawn_cwd, env=env,
                 dimensions=(pending_rows[0], pending_cols[0]),
             )
+            _tolerate_invalid_utf8(proc)
             new_session = {
                 "proc": proc,
                 "ws": ws,
@@ -458,6 +475,9 @@ class TerminalHub:
                     pending_cols[0] = cols
                     pending_rows[0] = rows
                     if session is None:
+                        if session_id and session_id in self.terminated:
+                            await ws.close(code=4004, reason="session was closed")
+                            return
                         effective_cap = self._effective_cap_for_doc(doc_id, declared_cap)
                         if self._sessions_for_doc(doc_id) >= effective_cap:
                             # Mirrors client-side limit
@@ -502,6 +522,8 @@ class TerminalHub:
                             log(log_prefix, "terminate() failed:", exc)
                         if self.sessions.get(key) is session:
                             del self.sessions[key]
+                        if session_id:
+                            self.terminated.add(session_id)
                         if session_id and self.host_bridge is not None:
                             self.host_bridge.fail_pending(session_id, "Shell was closed.")
                         log(log_prefix, "session terminated on request")

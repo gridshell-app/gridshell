@@ -507,10 +507,58 @@ def test_terminate_deletes_session_immediately_bypassing_idle_grace(server):
     # also doubles as the synchronization point here.
     client_a.wait_for_type("terminated")
 
-    client_b = TerminalClient(server.connect("/terminal", auth=auth))
-    client_b.send({"type": "resize", "cols": 80, "rows": 24})
-    client_b.wait_for_type("spawned")  # fresh spawn, immediately - no wait for any idle window
+    assert FakePtyProcess.instances[0].killed is True
+
+    # A terminated id is never respawned (a stale dialog racing the kill
+    # would otherwise leave a ghost shell counting toward the cap).
+    ws_b = server.connect("/terminal", auth=auth)
+    ws_b.send(json.dumps({"type": "resize", "cols": 80, "rows": 24}))
+    with pytest.raises(Exception):
+        ws_b.recv(timeout=2)
+    assert ws_b.close_code == 4004
+    assert len(FakePtyProcess.instances) == 1
+
+    # A different id still spawns immediately - no wait for any idle window.
+    client_c = TerminalClient(server.connect("/terminal", auth={"session": "terminate-test-2"}))
+    client_c.send({"type": "resize", "cols": 80, "rows": 24})
+    client_c.wait_for_type("spawned")
     assert len(FakePtyProcess.instances) == 2
+
+
+def test_tolerate_invalid_utf8_swaps_in_a_replacing_decoder():
+    import codecs
+
+    class StubPty:
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+
+    proc = StubPty()
+    with pytest.raises(UnicodeDecodeError):
+        proc.decoder.decode(b"ab\xd1x")
+    proc.decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
+    server_module._tolerate_invalid_utf8(proc)
+    assert proc.decoder.decode(b"ab\xd1x") == "ab�x"
+    # No decoder attribute (pywinpty) is left alone.
+    server_module._tolerate_invalid_utf8(object())
+
+
+def test_reader_error_kills_the_process_instead_of_orphaning_it(server, monkeypatch):
+    class BrokenReadPty(FakePtyProcess):
+        def read(self, size=4096):
+            item = self._queue.get()
+            if item == "BAD":
+                raise UnicodeDecodeError("utf-8", b"\xd1x", 0, 1, "invalid continuation byte")
+            if item is None:
+                raise EOFError("closed")
+            return item
+
+    monkeypatch.setattr(server_module, "PtyProcess", BrokenReadPty)
+    client = TerminalClient(server.connect("/terminal", auth={"session": "reader-error-test"}))
+    client.send({"type": "resize", "cols": 80, "rows": 24})
+    client.wait_for_type("spawned")
+    client.send({"type": "input", "data": "BAD"})
+    end = time.time() + 3
+    while time.time() < end and not FakePtyProcess.instances[0].killed:
+        time.sleep(0.05)
     assert FakePtyProcess.instances[0].killed is True
 
 

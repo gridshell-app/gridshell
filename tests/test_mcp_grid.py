@@ -78,10 +78,10 @@ def test_build_runtime_config_rejects_unknown_flag(monkeypatch):
         mcp_grid.build_runtime_config()
 
 
-def test_on_list_tools_returns_the_four_documented_tools():
+def test_on_list_tools_returns_the_documented_tools():
     result = asyncio.run(mcp_grid.on_list_tools(None, None))
     names = {tool.name for tool in result.tools}
-    assert names == {"runBatch", "getValues", "setValues", "appendRow"}
+    assert names == {"runBatch", "runBatchGuide", "getValues", "setValues", "appendRow"}
 
 
 @pytest.mark.parametrize(
