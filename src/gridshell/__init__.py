@@ -21,7 +21,7 @@ from .exceptions import (
 )
 from .sheets import SheetsClient
 
-__version__ = "1.0.0b3"
+__version__ = "1.0.0b4"
 
 __all__ = [
     "SheetsClient",

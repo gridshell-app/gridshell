@@ -28,6 +28,17 @@
       "additionalProperties": false
     },
     {
+      "title": "liveSessions",
+      "description": "Answers the server's `reconcile`: the session ids of every shell the client still has for this document. Sessions of the document the list doesn't contain are closed.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "liveSessions" },
+        "ids": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["type", "ids"],
+      "additionalProperties": false
+    },
+    {
       "title": "terminate",
       "description": "Kills the shell immediately and deletes the session, bypassing the idle-grace timer entirely. Distinct from simply closing the WebSocket, which only starts the idle-grace countdown (see README.md).",
       "type": "object",

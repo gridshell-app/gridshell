@@ -37,7 +37,7 @@
     },
     {
       "title": "resized",
-      "description": "Acknowledges a `resize` message sent against an already-spawned session - confirms the underlying process has actually been resized, so the client can safely reflow its own terminal emulator buffer without racing the resize. Never sent in response to the very first `resize` (that one triggers `spawned` instead).",
+      "description": "Acknowledges a `resize` message sent against an already-spawned session - confirms the underlying process has actually been resized, so the client can safely reflow its own terminal emulator buffer without racing the resize. Never sent in response to the very first `resize` (that one triggers `spawned` instead). A client that declares the `timeline` capability also gets `resized` inside a replay: first the size the replayed data was written at, then wherever the size changed in between, each ordered against the `output` messages around it.",
       "type": "object",
       "properties": {
         "type": { "const": "resized" },
@@ -64,6 +64,27 @@
       "type": "object",
       "properties": {
         "type": { "const": "evicted" }
+      },
+      "required": ["type"],
+      "additionalProperties": false
+    },
+    {
+      "title": "hello",
+      "description": "Only sent to a client that declared the `hello` capability. Sent immediately before `spawned` or `attached`, so a client that has seen `spawned`/`attached` without a `hello` knows it is talking to a server older than this message. `protocol` is an integer the server raises only when a release brings a change that clients' users should be nudged to update for. A client may compare it against the lowest level it considers current.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "hello" },
+        "protocol": { "type": "integer", "minimum": 1 }
+      },
+      "required": ["type", "protocol"],
+      "additionalProperties": false
+    },
+    {
+      "title": "reconcile",
+      "description": "Only sent to a client that declared the `reconcile` capability, in place of refusing a new shell because the document is at its shell cap. Asks the client to reply with `liveSessions`, the ids of the shells it still has. The server then closes sessions of that document missing from the list and spawns the new shell if that made room. No reply within a few seconds counts as a refusal.",
+      "type": "object",
+      "properties": {
+        "type": { "const": "reconcile" }
       },
       "required": ["type"],
       "additionalProperties": false

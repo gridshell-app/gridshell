@@ -478,6 +478,202 @@ def test_session_cap_falls_back_to_the_default_when_no_cap_is_declared(server):
     assert ws3.close_code == 1013
 
 
+def _spawn_in_doc(handle, session, doc_id, caps=None):
+    auth = {"session": session, "docId": doc_id}
+    if caps is not None:
+        auth["caps"] = caps
+    client = TerminalClient(handle.connect("/terminal", auth=auth))
+    client.send({"type": "resize", "cols": 80, "rows": 24})
+    return client
+
+
+def test_reconcile_closes_sessions_the_client_no_longer_lists_and_spawns(server):
+    server.terminal_hub.reconcile_grace_s = 0
+    for sid in ("docR-1", "docR-2"):
+        _spawn_in_doc(server, sid, "docR").wait_for_type("spawned")
+
+    third = _spawn_in_doc(server, "docR-3", "docR", caps=["reconcile"])
+    third.wait_for_type("reconcile")
+    third.send({"type": "liveSessions", "ids": ["docR-1", "docR-3"]})
+    third.wait_for_type("spawned")
+
+    assert not FakePtyProcess.instances[0].killed
+    assert FakePtyProcess.instances[1].killed
+    assert "docR-2" in server.terminal_hub.terminated
+    assert "docR-2" not in server.terminal_hub.sessions
+
+
+def test_reconcile_still_refuses_when_every_session_is_listed(server):
+    server.terminal_hub.reconcile_grace_s = 0
+    for sid in ("docF-1", "docF-2"):
+        _spawn_in_doc(server, sid, "docF").wait_for_type("spawned")
+
+    third = _spawn_in_doc(server, "docF-3", "docF", caps=["reconcile"])
+    third.wait_for_type("reconcile")
+    third.send({"type": "liveSessions", "ids": ["docF-1", "docF-2", "docF-3"]})
+    with pytest.raises(Exception):
+        third.ws.recv(timeout=2)
+    assert third.ws.close_code == 1013
+    assert not any(p.killed for p in FakePtyProcess.instances)
+
+
+def test_reconcile_keeps_sessions_younger_than_the_grace_period(server):
+    for sid in ("docG-1", "docG-2"):
+        _spawn_in_doc(server, sid, "docG").wait_for_type("spawned")
+
+    third = _spawn_in_doc(server, "docG-3", "docG", caps=["reconcile"])
+    third.wait_for_type("reconcile")
+    third.send({"type": "liveSessions", "ids": ["docG-3"]})
+    with pytest.raises(Exception):
+        third.ws.recv(timeout=2)
+    assert third.ws.close_code == 1013
+    assert not any(p.killed for p in FakePtyProcess.instances)
+
+
+def test_reconcile_without_an_answer_refuses_like_before(server):
+    server.terminal_hub.reconcile_timeout_s = 0.3
+    server.terminal_hub.reconcile_grace_s = 0
+    for sid in ("docT-1", "docT-2"):
+        _spawn_in_doc(server, sid, "docT").wait_for_type("spawned")
+
+    third = _spawn_in_doc(server, "docT-3", "docT", caps=["reconcile"])
+    third.wait_for_type("reconcile")
+    with pytest.raises(Exception):
+        third.ws.recv(timeout=2)
+    assert third.ws.close_code == 1013
+    assert not any(p.killed for p in FakePtyProcess.instances)
+
+
+def test_reconcile_is_skipped_without_a_doc_id(server):
+    for i in range(2):
+        client = TerminalClient(server.connect("/terminal", auth={"session": "nodocR-%d" % i, "caps": ["reconcile"]}))
+        client.send({"type": "resize", "cols": 80, "rows": 24})
+        client.wait_for_type("spawned")
+
+    ws3 = server.connect("/terminal", auth={"session": "nodocR-2", "caps": ["reconcile"]})
+    ws3.send(json.dumps({"type": "resize", "cols": 80, "rows": 24}))
+    with pytest.raises(Exception):
+        ws3.recv(timeout=2)
+    assert ws3.close_code == 1013
+
+
+def test_terminate_before_spawn_is_acked_and_blocks_the_later_spawn(server):
+    # A shell closed while its dialog is still opening: the terminate lands
+    # first, the dialog's spawn arrives after.
+    auth = {"session": "early-kill", "hostKey": "hk-early"}
+    killer = TerminalClient(server.connect("/terminal", auth=auth))
+    killer.send({"type": "terminate"})
+    killer.wait_for_type("terminated")
+
+    late = server.connect("/terminal", auth=auth)
+    late.send(json.dumps({"type": "resize", "cols": 80, "rows": 24}))
+    with pytest.raises(Exception):
+        late.recv(timeout=2)
+    assert late.close_code == 4004
+    assert FakePtyProcess.instances == []
+
+
+def test_hello_comes_before_spawned_and_before_attached(server):
+    auth = {"session": "hello-test", "hostKey": "hk-hello", "caps": ["hello"]}
+    first = TerminalClient(server.connect("/terminal", auth=auth))
+    first.send({"type": "resize", "cols": 80, "rows": 24})
+    first.wait_for_type("spawned")
+    types = [m["type"] for m in first.messages]
+    assert types.index("hello") < types.index("spawned")
+    assert first.messages[types.index("hello")]["protocol"] == server_module.PROTOCOL_LEVEL
+    first.ws.close()
+
+    second = TerminalClient(server.connect("/terminal", auth=auth))
+    second.wait_for_type("attached")
+    types = [m["type"] for m in second.messages]
+    assert types.index("hello") < types.index("attached")
+
+
+def test_no_hello_without_the_capability_or_for_a_refused_spawn(server):
+    plain = TerminalClient(server.connect("/terminal", auth={"session": "nohello-0"}))
+    plain.send({"type": "resize", "cols": 80, "rows": 24})
+    plain.wait_for_type("spawned")
+    assert not any(m["type"] == "hello" for m in plain.messages)
+
+    client = TerminalClient(server.connect("/terminal", auth={"session": "nohello-1", "caps": ["hello"]}))
+    client.send({"type": "resize", "cols": 80, "rows": 24})
+    client.wait_for_type("spawned")
+
+    ws3 = server.connect("/terminal", auth={"session": "nohello-2", "caps": ["hello"]})
+    ws3.send(json.dumps({"type": "resize", "cols": 80, "rows": 24}))
+    with pytest.raises(Exception):
+        ws3.recv(timeout=2)
+    assert ws3.close_code == 1013
+
+
+def _output_ending_with(text):
+    return lambda m: m.get("type") == "output" and m.get("data", "").endswith(text)
+
+
+def test_timeline_replay_carries_the_size_each_stretch_was_written_at(server):
+    auth = {"session": "timeline-test", "hostKey": "hk-timeline", "caps": ["timeline"]}
+    first = TerminalClient(server.connect("/terminal", auth=auth))
+    first.send({"type": "resize", "cols": 80, "rows": 24})
+    first.wait_for_type("spawned")
+    first.send({"type": "input", "data": "one"})
+    first.wait_for(_output_ending_with("one"))
+    first.send({"type": "resize", "cols": 100, "rows": 30})
+    first.wait_for_type("resized")
+    first.send({"type": "input", "data": "two"})
+    first.wait_for(_output_ending_with("two"))
+    first.ws.close()
+
+    second = TerminalClient(server.connect("/terminal", auth=auth))
+    second.wait_for_type("attached")
+    second.wait_for(lambda m: m.get("type") == "output" and m.get("data") == "two")
+    replay = [m for m in second.messages if m["type"] != "attached"]
+    assert [(m["type"], m.get("cols"), m.get("rows")) for m in replay if m["type"] == "resized"] == [
+        ("resized", 80, 24), ("resized", 100, 30)]
+    assert [m["type"] for m in replay] == ["resized", "output", "resized", "output"]
+    assert replay[1]["data"].endswith("one")
+
+
+def test_replay_for_a_client_without_the_timeline_capability_has_no_size_messages(server):
+    auth = {"session": "plain-replay-test", "hostKey": "hk-plain"}
+    first = TerminalClient(server.connect("/terminal", auth=auth))
+    first.send({"type": "resize", "cols": 80, "rows": 24})
+    first.wait_for_type("spawned")
+    first.send({"type": "input", "data": "one"})
+    first.wait_for(_output_ending_with("one"))
+    first.send({"type": "resize", "cols": 100, "rows": 30})
+    first.wait_for_type("resized")
+    first.send({"type": "input", "data": "two"})
+    first.wait_for(_output_ending_with("two"))
+    first.ws.close()
+
+    second = TerminalClient(server.connect("/terminal", auth=auth))
+    second.wait_for_type("attached")
+    second.wait_for(_output_ending_with("onetwo"))
+    assert not any(m["type"] == "resized" for m in second.messages)
+
+
+def test_resizing_to_the_current_size_records_no_marker():
+    session = {"buffer": [], "buffer_bytes": 0, "buffer_lock": threading.Lock(), "cur_size": (80, 24)}
+    server_module._record_size(session, 80, 24)
+    assert session["buffer"] == []
+    server_module._record_size(session, 100, 30)
+    assert session["buffer"] == [(100, 30)]
+
+
+def test_trimming_the_buffer_keeps_the_size_the_kept_data_was_written_at():
+    session = {"buffer": [], "buffer_bytes": 0, "buffer_max_bytes": 8, "buffer_lock": threading.Lock(),
+               "handshake_done": True, "cur_size": (80, 24), "base_size": (80, 24)}
+    server_module._ingest_into_buffer(session, "aaaaaa")
+    server_module._record_size(session, 100, 30)
+    server_module._ingest_into_buffer(session, "bbbbbb")
+    server_module._ingest_into_buffer(session, "cccccc")
+    assert session["base_size"] == (100, 30)
+    assert server_module._replay_messages(session, True, 1024) == [
+        {"type": "resized", "cols": 100, "rows": 30},
+        {"type": "output", "data": "cccccc"},
+    ]
+
+
 def test_idle_session_killed_after_window_then_reconnect_spawns_fresh(server):
     # A tiny idleHours value converts to a few ms of real grace period. No
     # fake/mocked clock needed, since idle timeout is a real per-connection

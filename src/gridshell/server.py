@@ -64,6 +64,7 @@ import ssl
 import subprocess
 import sys
 import threading
+import time
 from collections import deque
 from datetime import datetime
 from urllib.parse import parse_qs, urlparse
@@ -106,10 +107,9 @@ _AUTO_ANSWERED_QUERY_RE = re.compile(r"\x1b\[>?0?c|\x1b\[6n")
 
 
 def _ingest_into_buffer(this_session, data):
-    # Strip one-time startup negotiation from the replay buffer. Replaying
-    # it makes xterm.js re-answer it, which PSReadLine can misparse as a
-    # keystroke. Only checked pre-handshake: a permanent whole-chunk filter
-    # would also strip legitimate TUI redraw chunks.
+    # Strip startup negotiation from the replay buffer: replayed, xterm.js
+    # re-answers it and PSReadLine can misparse that as a keystroke.
+    # Pre-handshake only, or legitimate TUI redraw chunks would go too.
     if not this_session["handshake_done"]:
         if _is_pure_negotiation(data):
             return
@@ -127,25 +127,66 @@ def _ingest_into_buffer(this_session, data):
         this_session["buffer_bytes"] += len(data.encode("utf-8"))
         while this_session["buffer_bytes"] > this_session["buffer_max_bytes"] and len(this_session["buffer"]) > 1:
             dropped = this_session["buffer"].pop(0)
-            this_session["buffer_bytes"] -= len(dropped.encode("utf-8"))
+            if isinstance(dropped, tuple):
+                # A size marker: the kept data now starts at this size.
+                this_session["base_size"] = dropped
+            else:
+                this_session["buffer_bytes"] -= len(dropped.encode("utf-8"))
+
+
+def _record_size(this_session, cols, rows):
+    # The replay buffer holds output written at different terminal sizes.
+    # A (cols, rows) tuple between the output chunks marks where the size
+    # changed, so a reattach can replay each stretch at its own width.
+    with this_session["buffer_lock"]:
+        if this_session["cur_size"] == (cols, rows):
+            return
+        this_session["cur_size"] = (cols, rows)
+        this_session["buffer"].append((cols, rows))
+
+
+def _replay_messages(this_session, with_sizes, max_bytes):
+    # Scrollback as wire messages: with `resized` markers for "timeline"
+    # clients, otherwise the joined output only.
+    with this_session["buffer_lock"]:
+        items = list(this_session["buffer"])
+        base = this_session["base_size"]
+    if not any(isinstance(i, str) for i in items):
+        return []
+    messages = []
+    if with_sizes:
+        messages.append({"type": "resized", "cols": base[0], "rows": base[1]})
+    run = []
+
+    def flush():
+        if run:
+            for piece in _split_for_max_message("".join(run), max_bytes):
+                messages.append({"type": "output", "data": piece})
+            del run[:]
+
+    for item in items:
+        if isinstance(item, tuple):
+            if with_sizes:
+                flush()
+                messages.append({"type": "resized", "cols": item[0], "rows": item[1]})
+        else:
+            run.append(item)
+    flush()
+    return messages
 
 
 def _split_for_max_message(text, max_bytes):
-    # A replay buffer bigger than --max-message-mb would otherwise go out
-    # as one oversized send, silently dropped by both ends - split into
-    # multiple sends instead. Conservative budget: JSON escaping can expand
-    # 1 character up to 12 bytes (a surrogate-pair \uXXXX\uXXXX), divided
-    # here rather than measured and retried.
+    # Split a replay bigger than --max-message-mb into several sends, an
+    # oversized one is silently dropped. Budget assumes JSON escaping can
+    # expand 1 character up to 12 bytes (a surrogate pair as \uXXXX\uXXXX).
     envelope_overhead = 32  # {"type":"output","data":"..."}
     budget = max(1, (max_bytes - envelope_overhead) // 12)
     return [text[i:i + budget] for i in range(0, len(text), budget)]
 
 DEFAULT_IDLE_KILL_MS = 12 * 60 * 60 * 1000
 DEFAULT_BUFFER_MAX_BYTES = 8 * 1024 * 1024
-# Caps live-output chunks queued for a slow client. Reader_loop reads at
-# most 4096 bytes per chunk, so this bounds pending memory to ~1MB per
-# session regardless of how far behind the client falls. Independent of
-# the replay buffer above, which keeps its own cap for reattach scrollback.
+# Caps live-output chunks queued for a slow client (4096 bytes each, so
+# ~1MB per session). Independent of the replay buffer's own cap.
 OUTPUT_QUEUE_MAX_CHUNKS = 256
 # Raised well above the websockets default (1 MiB), a normal Sheets range
 # easily exceeds that.
@@ -171,10 +212,9 @@ def _shell_display_path():
 
 
 def parse_hours_param(qs, name, ceiling_ms):
-    # 0 means explicit zero grace, matching --idle-hours 0 on the CLI.
-    # Negative/unparsable/missing all mean "no override".
-    # Clamped to ceiling_ms - an untrusted page shouldn't be able to opt a
-    # session out of idle-kill by passing a huge value.
+    # 0 means zero grace (like --idle-hours 0); negative, unparsable or
+    # missing means "no override". Clamped to ceiling_ms so an untrusted
+    # page can't opt a session out of idle-kill.
     raw = qs.get(name, [None])[0]
     if raw is None:
         return None
@@ -201,11 +241,16 @@ def parse_mb_param(qs, name, ceiling_bytes):
     return min(mb * 1024 * 1024, ceiling_bytes) if mb > 0 else None
 
 
-# v1 free-tier cap, mirrors the client's own Pro-tier-reserved limit - not
-# a CLI flag for the same reason. Enforced per doc_id (see
-# _sessions_for_doc); used as the fallback default when a doc's first
-# connection didn't declare its own cap (see TerminalHub.doc_caps).
+# v1 free-tier cap, mirrors the client's limit (not a CLI flag for the same
+# reason). Per doc_id; the fallback when a doc declared no cap of its own.
 MAX_CONCURRENT_SESSIONS = 2
+
+# Sent in `hello`; raise only for releases worth nudging users to update for.
+PROTOCOL_LEVEL = 1
+
+# Wait for the client's shell list; sessions younger than the grace aren't reaped.
+RECONCILE_TIMEOUT_S = 5
+RECONCILE_GRACE_S = 15
 
 
 class TerminalHub:
@@ -232,15 +277,70 @@ class TerminalHub:
         # Ids killed via "terminate". Never reused, so a later spawn under one
         # is a stale dialog racing the kill.
         self.terminated = set()
+        self.reconcile_timeout_s = RECONCILE_TIMEOUT_S
+        self.reconcile_grace_s = RECONCILE_GRACE_S
 
     def _sessions_for_doc(self, doc_id):
         return sum(1 for s in self.sessions.values() if s.get("doc_id", "") == doc_id)
 
+    def _discard_session(self, key, sess):
+        if sess["idle_timer"] is not None:
+            sess["idle_timer"].cancel()
+        try:
+            sess["proc"].terminate(force=True)
+        except Exception as exc:
+            log("[terminal:%s]" % key, "terminate() failed:", exc)
+        if self.sessions.get(key) is sess:
+            del self.sessions[key]
+        self.terminated.add(key)
+        if self.host_bridge is not None:
+            self.host_bridge.fail_pending(key, "Shell was closed.")
+
+    async def _ask_live_sessions(self, ws):
+        # The client's own list of the shells that still exist, or None if
+        # it doesn't answer in time. Reads straight from the socket: this
+        # runs inside the message loop, which isn't reading meanwhile.
+        await ws.send(json.dumps({"type": "reconcile"}))
+        deadline = asyncio.get_running_loop().time() + self.reconcile_timeout_s
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return None
+            try:
+                raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                m = json.loads(raw)
+            except asyncio.TimeoutError:
+                return None
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(m, dict) and m.get("type") == "liveSessions":
+                ids = m.get("ids")
+                if isinstance(ids, list) and all(isinstance(i, str) for i in ids):
+                    return set(ids)
+                return None
+
+    def _reap_unlisted(self, doc_id, live_ids):
+        # A session the client no longer lists lost its shell entry without
+        # the server hearing about it. Sessions younger than the grace period
+        # are kept, their entry may postdate the list the client just read.
+        now = time.monotonic()
+        reaped = []
+        for key, sess in list(self.sessions.items()):
+            if sess.get("doc_id", "") != doc_id or key in live_ids:
+                continue
+            if now - sess["created_at"] < self.reconcile_grace_s:
+                continue
+            old_ws = sess["ws"]
+            self._discard_session(key, sess)
+            if old_ws is not None:
+                asyncio.ensure_future(old_ws.close(code=4004, reason="session was closed"))
+            reaped.append(key)
+        if reaped:
+            log("[reconcile]", "doc", doc_id, "closed sessions missing from the client's list:", ", ".join(reaped))
+
     def _effective_cap_for_doc(self, doc_id, declared_cap):
-        # Latched from whichever /terminal connection for this doc_id
-        # arrives first, for the rest of this server run. Later
-        # connections cannot change it. A client that omits
-        # or sends a malformed value falls back to the hardcoded default.
+        # Latched from the first /terminal connection for this doc_id, for
+        # the server run. A missing or malformed value falls back to the default.
         if doc_id not in self.doc_caps:
             if isinstance(declared_cap, int) and not isinstance(declared_cap, bool) and declared_cap > 0:
                 self.doc_caps[doc_id] = declared_cap
@@ -248,7 +348,7 @@ class TerminalHub:
                 self.doc_caps[doc_id] = MAX_CONCURRENT_SESSIONS
         return self.doc_caps[doc_id]
 
-    async def handle(self, ws, session_id, host_key="", doc_id="", declared_cap=None):
+    async def handle(self, ws, session_id, host_key="", doc_id="", declared_cap=None, caps=()):
         loop = asyncio.get_running_loop()
         qs = parse_qs(urlparse(ws.request.path).query)
         cwd_param = (qs.get("cwd") or [None])[0]
@@ -258,10 +358,8 @@ class TerminalHub:
             if os.path.isabs(cwd_param) and os.path.isdir(cwd_param):
                 spawn_cwd = os.path.normpath(cwd_param)
             else:
-                # A relative path, typo, missing directory, wrong-OS path,
-                # or a path to a file all fall back to the server's
-                # default silently otherwise - told to the client once,
-                # right after spawn.
+                # An invalid cwd (relative, missing, wrong OS, a file) falls
+                # back to the default; the client is told once after spawn.
                 cwd_warning = "Working directory %r isn't usable on this server - started in the default location instead." % cwd_param
         idle_kill_ms_param = parse_hours_param(qs, "idleHours", self.defaults["idle_kill_ms"])
         buffer_max_bytes_param = parse_mb_param(qs, "bufferMb", self.defaults["buffer_max_bytes"])
@@ -297,15 +395,15 @@ class TerminalHub:
             # send_lock keeps this atomic with reader_loop's live forwarding,
             # so a live chunk can't interleave with this replay. buffer_lock
             # separately guards the "".join against the reader thread.
-            with sess["buffer_lock"]:
-                replay = "".join(sess["buffer"]) if sess["buffer"] else None
+            replay = _replay_messages(sess, "timeline" in caps, self.max_message_bytes)
             async with sess["send_lock"]:
                 sess["ws"] = ws
                 try:
+                    if "hello" in caps:
+                        await ws.send(json.dumps({"type": "hello", "protocol": PROTOCOL_LEVEL}))
                     await ws.send(json.dumps({"type": "attached"}))
-                    if replay is not None:
-                        for piece in _split_for_max_message(replay, self.max_message_bytes):
-                            await ws.send(json.dumps({"type": "output", "data": piece}))
+                    for message in replay:
+                        await ws.send(json.dumps(message))
                 except Exception as exc:
                     # This log line is the only signal anything went wrong -
                     # the client never learns its scrollback replay didn't
@@ -314,10 +412,8 @@ class TerminalHub:
             log(log_prefix, "attached to session:", key)
 
         if session:
-            # Reattach requires the same host_key /host already requires -
-            # a session id alone isn't proof of ownership. Not checked on a
-            # fresh spawn (session is None here); nothing exists yet to
-            # compare against.
+            # Reattach requires the host_key /host requires, a session id
+            # alone isn't proof of ownership. Not checked on a fresh spawn.
             expected_key = session.get("host_key")
             if not expected_key or not hmac.compare_digest(
                 (host_key or "").encode("utf-8"), expected_key.encode("utf-8")
@@ -337,10 +433,8 @@ class TerminalHub:
                         pass
 
         async def drain_send_queue(this_session):
-            # One of these runs at a time per session (send_pending guards
-            # that), draining in order, rather than one coroutine per
-            # chunk piling up unbounded when the client is slower than
-            # the shell.
+            # One runs at a time per session (send_pending), draining in order,
+            # instead of a coroutine per chunk piling up behind a slow client.
             while True:
                 with this_session["send_queue_lock"]:
                     if not this_session["send_queue"]:
@@ -362,10 +456,8 @@ class TerminalHub:
                     continue
                 _ingest_into_buffer(this_session, data)
                 with this_session["send_queue_lock"]:
-                    # Bounded deque(maxlen=...) - appending past capacity
-                    # silently drops the oldest unsent output instead of
-                    # growing memory without bound. Live output only; the
-                    # replay buffer above keeps its own separate cap.
+                    # Bounded deque: past capacity the oldest unsent output is
+                    # dropped rather than growing memory. Live output only.
                     this_session["send_queue"].append(data)
                     already_pending = this_session["send_pending"]
                     this_session["send_pending"] = True
@@ -437,9 +529,8 @@ class TerminalHub:
                 # Serializes sends, see attach()'s comment.
                 "send_lock": asyncio.Lock(),
                 # Bounded live-output queue, see reader_loop/drain_send_queue.
-                # Thread-safe handoff between the reader thread and the
-                # event loop, separate from send_lock (which only
-                # serializes the actual ws.send calls).
+                # Hands off between the reader thread and the event loop;
+                # send_lock only serializes the ws.send calls.
                 "send_queue": deque(maxlen=OUTPUT_QUEUE_MAX_CHUNKS),
                 "send_queue_lock": threading.Lock(),
                 "send_pending": False,
@@ -447,6 +538,12 @@ class TerminalHub:
                 "handshake_done": False,
                 # Groups this session for MAX_CONCURRENT_SESSIONS.
                 "doc_id": doc_id,
+                # Terminal size now, and the size the oldest kept buffer
+                # data was written at, see _record_size.
+                "cur_size": (pending_cols[0], pending_rows[0]),
+                "base_size": (pending_cols[0], pending_rows[0]),
+                # Exempts a fresh session from reconcile, see _reap_unlisted.
+                "created_at": time.monotonic(),
             }
             self.sessions[key] = new_session
             session = new_session
@@ -467,10 +564,8 @@ class TerminalHub:
                         cols = max(1, int(m.get("cols", 80)))
                         rows = max(1, int(m.get("rows", 24)))
                     except (TypeError, ValueError):
-                        # /terminal is reachable by anything holding the
-                        # token, not just the stock client - a malformed
-                        # value is caught here rather than raising out of
-                        # the loop and killing the connection silently.
+                        # Any token holder can reach /terminal, not just the stock
+                        # client: catch a malformed value instead of killing the loop.
                         continue
                     pending_cols[0] = cols
                     pending_rows[0] = rows
@@ -479,15 +574,22 @@ class TerminalHub:
                             await ws.close(code=4004, reason="session was closed")
                             return
                         effective_cap = self._effective_cap_for_doc(doc_id, declared_cap)
+                        # Over the cap a client that lists its own shells is
+                        # asked first: a session it no longer knows is a
+                        # leftover, and freeing it may make room.
+                        if (self._sessions_for_doc(doc_id) >= effective_cap
+                                and doc_id and "reconcile" in caps):
+                            live_ids = await self._ask_live_sessions(ws)
+                            if live_ids is not None:
+                                self._reap_unlisted(doc_id, live_ids)
                         if self._sessions_for_doc(doc_id) >= effective_cap:
-                            # Mirrors client-side limit
-                            # per document (latched from this doc's first
-                            # connection, see _effective_cap_for_doc).
-                            # 1013 rather than 1008 so the client doesn't
-                            # show the token-specific rejection hint.
+                            # Per-document limit (see _effective_cap_for_doc). 1013,
+                            # not 1008, so the client skips the token-rejection hint.
                             await ws.close(code=1013, reason="session limit reached (%d) for this document" % effective_cap)
                             return
                         new_session = spawn_process()
+                        if "hello" in caps:
+                            await ws.send(json.dumps({"type": "hello", "protocol": PROTOCOL_LEVEL}))
                         await ws.send(json.dumps({"type": "spawned"}))
                         if cwd_warning:
                             await ws.send(json.dumps({"type": "warning", "message": cwd_warning}))
@@ -498,6 +600,7 @@ class TerminalHub:
                         await send_output(new_session, title_data)
                         session = new_session
                     else:
+                        _record_size(session, pending_cols[0], pending_rows[0])
                         session["proc"].setwinsize(pending_rows[0], pending_cols[0])
                         await ws.send(json.dumps({
                             "type": "resized", "cols": pending_cols[0], "rows": pending_rows[0]
@@ -505,10 +608,9 @@ class TerminalHub:
                 elif mtype == "input":
                     if session is not None:
                         data = m.get("data", "")
-                        # xterm.js auto-answers the shell's DA1 startup
-                        # query via onData. Under load this can arrive
-                        # late enough for PSReadLine to insert it literally.
-                        # Matches _ingest_into_buffer's reattach-side filter.
+                        # xterm.js answers the shell's DA1 startup query via onData;
+                        # under load PSReadLine can insert it literally. Matches
+                        # _ingest_into_buffer's reattach-side filter.
                         if not session["handshake_done"] and _is_pure_negotiation(data):
                             continue
                         session["proc"].write(data)
@@ -529,6 +631,14 @@ class TerminalHub:
                         log(log_prefix, "session terminated on request")
                         # The client waits for this before treating the kill as confirmed, 
                         # rather than assuming success once the message was merely sent.
+                        try:
+                            await ws.send(json.dumps({"type": "terminated"}))
+                        except Exception:
+                            pass
+                    elif session_id:
+                        # Still opening: remember the id so its spawn is refused.
+                        self.terminated.add(session_id)
+                        log(log_prefix, "terminate before spawn, session id blocked")
                         try:
                             await ws.send(json.dumps({"type": "terminated"}))
                         except Exception:
@@ -599,10 +709,8 @@ class HostBridge:
                 asyncio.ensure_future(entry["resolve"]({"error": reason}))
 
     def _fail_in_flight(self, session_id, ws, too_large=False):
-        # Fails immediately rather than waiting for a timeout, scoped to
-        # this exact ws so a newer reconnect isn't touched. too_large is
-        # the exception: nothing was delivered, so "outcome unknown"
-        # doesn't apply.
+        # Fails immediately, scoped to this exact ws so a newer reconnect
+        # isn't touched. Not too_large: nothing was delivered.
         if too_large:
             reason = ("The response was too large for this connection's message-size limit "
                       "and never arrived - nothing was delivered, safe to retry with a "
@@ -635,15 +743,11 @@ class HostBridge:
             return
         old_ws = self.clients.get(session_id)
         if old_ws is not None and old_ws is not ws:
-            # A silently overwritten dict entry left the old socket open
-            # with nothing routing to it. Closing it explicitly lets its
-            # own client see the disconnect and reconnect instead of
-            # looking "connected" while every call to it times out.
+            # Close the old socket explicitly: overwritten silently, it looks
+            # "connected" to its client while every call to it times out.
             try:
-                # Not 1008 - that means "don't bother retrying" to the
-                # sidebar. This is a routine handover, not a rejection: the
-                # old tab should keep retrying to reclaim the bridge if
-                # the newer connection later drops.
+                # Not 1008, which tells the sidebar to stop retrying: this is a
+                # handover, the old tab may reclaim the bridge later.
                 await old_ws.close(code=4000, reason="superseded by a new /host connection")
             except Exception:
                 pass
@@ -811,6 +915,11 @@ def create_app(idle_hours, buffer_mb, required_token=None, allowed_origin_suffix
         # /terminal only - the per-document session cap this doc's first
         # connection declares. See TerminalHub._effective_cap_for_doc.
         declared_cap = auth.get("declaredCap")
+        # /terminal only - optional protocol extensions the client understands
+        # ("timeline", "reconcile"). Anything else, or a malformed value, is
+        # ignored, and a client that sends none gets the original behavior.
+        raw_caps = auth.get("caps")
+        caps = frozenset(c for c in raw_caps if isinstance(c, str)) if isinstance(raw_caps, list) else frozenset()
         # session_id alone isn't a credential, required_token is what
         # actually gates access. See the module docstring.
         if required_token is not None:
@@ -823,7 +932,7 @@ def create_app(idle_hours, buffer_mb, required_token=None, allowed_origin_suffix
                 return
         path = urlparse(ws.request.path).path
         if path == "/terminal":
-            await terminal_hub.handle(ws, session_id, host_key, doc_id, declared_cap)
+            await terminal_hub.handle(ws, session_id, host_key, doc_id, declared_cap, caps)
         elif path == "/host":
             await host_bridge.handle(ws, session_id, host_key)
         elif path == "/mcp":
@@ -842,15 +951,19 @@ def _kill_all_sessions(terminal_hub):
             pass
 
 
-def _install_shutdown_hook(terminal_hub):
-    # Ties spawned shells' lifetime to the server process, without this a
-    # restart orphans every running PTY. atexit covers Ctrl+C; SIGTERM
-    # needs an explicit handler (POSIX only). A hard crash or forceful
-    # kill still isn't covered.
+def _install_shutdown_hook(terminal_hub, loop=None, stop=None):
+    # Ties shells to the server's lifetime, else a restart orphans every PTY.
+    # atexit covers Ctrl+C, SIGTERM needs a handler (POSIX). A hard kill isn't covered.
     atexit.register(_kill_all_sessions, terminal_hub)
 
     def _handle_signal(signum, frame):
         _kill_all_sessions(terminal_hub)
+        # Ending main() through the loop lets serve() close its connections.
+        # Exiting from inside the loop's select() instead breaks the open
+        # sockets' generators. A second signal exits at once.
+        if loop is not None and stop is not None and not stop.done():
+            loop.call_soon_threadsafe(lambda: stop.done() or stop.set_result(None))
+            return
         sys.exit(0)
 
     for sig_name in ("SIGINT", "SIGTERM"):
@@ -992,7 +1105,9 @@ async def main(port, idle_hours, buffer_mb, cert_path, key_path, use_wss, auth_t
         idle_hours, buffer_mb, required_token=auth_token,
         allowed_origin_suffixes=tuple(allow_origins), max_message_bytes=max_message_bytes,
     )
-    _install_shutdown_hook(terminal_hub)
+    loop = asyncio.get_running_loop()
+    stop = loop.create_future()
+    _install_shutdown_hook(terminal_hub, loop, stop)
 
     ssl_context = None
     if use_wss:
@@ -1015,7 +1130,7 @@ async def main(port, idle_hours, buffer_mb, cert_path, key_path, use_wss, auth_t
         print("  /terminal  xterm.js I/O")
         print("  /host      Host command bridge")
         print("  /mcp       MCP server relay")
-        await asyncio.Future()
+        await stop
 
 
 USAGE = """gridshell-server [--port N] [--host HOST] [--idle-hours H] [--buffer-mb M]
@@ -1169,10 +1284,8 @@ def resolve_flags():
             "prints the token itself. Read it directly from %s (or from wherever "
             "--auth-token/AUTH_TOKEN sources it, if set explicitly)." % _default_token_path()
         )
-    # Delivered only through the clipboard, never stdout (see module
-    # docstring). Starts normally even with no clipboard, since the token
-    # is already persisted to the file by then - only an actual persist
-    # failure refuses to start.
+    # Delivered through the clipboard only, never stdout (see module docstring).
+    # No clipboard is fine, the token is already in the file; a persist failure aborts.
     token_is_explicit = bool(auth_token)
     auth_token = _load_or_create_default_token(auth_token, no_auth_token, regenerate_token)
     if token_is_explicit:
