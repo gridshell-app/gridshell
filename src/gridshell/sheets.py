@@ -1,7 +1,7 @@
 """SheetsClient - GridShell's Google Sheets host, on top of the shared
 Connection transport."""
 
-from typing import Any, List, Optional
+from typing import Any
 
 from .exceptions import GridShellError
 from .transport import DEFAULT_TIMEOUT, Connection
@@ -60,14 +60,19 @@ class SheetsClient:
         host: str = "localhost",
         port: int = 3000,
         wss: bool = False,
-        session: Optional[str] = None,
-        session_key: Optional[str] = None,
-        token: Optional[str] = None,
+        session: str | None = None,
+        session_key: str | None = None,
+        token: str | None = None,
         default_timeout: float = DEFAULT_TIMEOUT,
     ):
         self._conn = Connection(
-            host=host, port=port, wss=wss, session=session, session_key=session_key,
-            token=token, default_timeout=default_timeout,
+            host=host,
+            port=port,
+            wss=wss,
+            session=session,
+            session_key=session_key,
+            token=token,
+            default_timeout=default_timeout,
         )
         self._budget_fetched = False
 
@@ -97,20 +102,22 @@ class SheetsClient:
             return
         self._budget_fetched = True
         try:
-            budget_ms = self._conn.call("getBatchTimeBudgetMs", {}, timeout=self._conn.default_timeout)
+            budget_ms = self._conn.call(
+                "getBatchTimeBudgetMs", {}, timeout=self._conn.default_timeout
+            )
         except Exception:
             return
         if isinstance(budget_ms, (int, float)) and budget_ms > 0:
             self._conn.default_timeout = (budget_ms / 1000) + BUDGET_MARGIN
 
-    def call(self, tool: str, params: Optional[dict] = None, timeout: Optional[float] = None) -> Any:
-        """Raw escape hatch - call any tool by name with a params dict. 
+    def call(self, tool: str, params: dict | None = None, timeout: float | None = None) -> Any:
+        """Raw escape hatch - call any tool by name with a params dict.
         Connects lazily on first use."""
         if not self._budget_fetched:
             self.connect()
         return self._conn.call(tool, params, timeout)
 
-    def run_batch(self, ops: List[dict], timeout: Optional[float] = None) -> Any:
+    def run_batch(self, ops: list[dict], timeout: float | None = None) -> Any:
         """The generic structured-chain escape hatch. `ops` is a list of
         {"chain": [...]} entries, each a sequence of {"method", "args"} steps
         (plus {"index"}/{"chartId"} lookups and {"__chain": [...]} builder
@@ -119,7 +126,7 @@ class SheetsClient:
         worked examples."""
         return self.call("runBatch", {"ops": ops}, timeout=timeout)
 
-    def _run_single_op(self, chain: List[dict], action: str, timeout: Optional[float]) -> Any:
+    def _run_single_op(self, chain: list[dict], action: str, timeout: float | None) -> Any:
         """Runs a one-op run_batch chain and unwraps the batch envelope
         into a plain value, or raises GridShellError with the envelope's
         detail. Used only by get_values()/set_values()'s selection path."""
@@ -130,16 +137,20 @@ class SheetsClient:
             # fluent setValues() call) means "value" may be absent, not null.
             return batch["results"][0].get("value")
         if status == "rejected":
-            raise GridShellError(batch.get("message") or f"{action} was rejected ({batch.get('reason')})")
+            raise GridShellError(
+                batch.get("message") or f"{action} was rejected ({batch.get('reason')})"
+            )
         error = batch.get("error") or {}
-        raise GridShellError(error.get("message") or f"{action} did not complete (reason: {batch.get('reason')})")
+        raise GridShellError(
+            error.get("message") or f"{action} did not complete (reason: {batch.get('reason')})"
+        )
 
     def get_values(
         self,
-        range: Optional[str] = None,
-        sheet: Optional[str] = None,
-        timeout: Optional[float] = None,
-    ) -> List[list]:
+        range: str | None = None,
+        sheet: str | None = None,
+        timeout: float | None = None,
+    ) -> list[list]:
         """Read a range's values.
 
         Omit `range` to read the current selection instead
@@ -167,9 +178,9 @@ class SheetsClient:
     def set_values(
         self,
         values: list,
-        range: Optional[str] = None,
-        sheet: Optional[str] = None,
-        timeout: Optional[float] = None,
+        range: str | None = None,
+        sheet: str | None = None,
+        timeout: float | None = None,
     ) -> None:
         """Write values into a range.
 
@@ -189,7 +200,10 @@ class SheetsClient:
                     "whichever sheet is currently active. Pass an explicit range "
                     "to target a different sheet."
                 )
-            chain = [{"method": "getActiveRange", "args": []}, {"method": "setValues", "args": [values]}]
+            chain = [
+                {"method": "getActiveRange", "args": []},
+                {"method": "setValues", "args": [values]},
+            ]
             self._run_single_op(chain, "set_values() on the current selection", timeout)
             return
         params = {"range": range, "values": values}
@@ -197,7 +211,9 @@ class SheetsClient:
             params["sheet"] = sheet
         self.call("setValues", params, timeout=timeout)
 
-    def append_row(self, values: list, sheet: Optional[str] = None, timeout: Optional[float] = None) -> None:
+    def append_row(
+        self, values: list, sheet: str | None = None, timeout: float | None = None
+    ) -> None:
         """Append one row after the end of the sheet's existing data."""
         _check_flat_row(values, "append_row()")
         params = {"values": values}

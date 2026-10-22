@@ -14,7 +14,7 @@ import json
 import os
 import random
 import string
-from typing import Any, Optional
+from typing import Any
 
 from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect as ws_connect
@@ -29,7 +29,7 @@ DEFAULT_TIMEOUT = 300
 # the server's own timeout message.
 CLIENT_MARGIN = 20
 
-# Matches server.py's DEFAULT_MAX_MESSAGE_BYTES, but a server started with
+# Matches the server's default (common.py), but a server started with
 # a raised --max-message-mb needs this raised too, or an oversized response
 # is rejected client-side regardless. Same $MAX_MESSAGE_MB env var as the
 # server, so one setting covers both sides.
@@ -42,7 +42,7 @@ def _generate_id() -> str:
 
 def _describe_close(exc: ConnectionClosed) -> str:
     # A rejected/missing token closes with code 1008 and a specific reason
-    # (server.py's router()) - surface it instead of a generic message that
+    # (create_app's router, app.py) - surface it instead of a generic message that
     # sends the user looking at their socket layer instead of their token.
     rcvd = getattr(exc, "rcvd", None)
     if rcvd is not None and rcvd.reason:
@@ -58,9 +58,9 @@ class Connection:
         host: str = "localhost",
         port: int = 3000,
         wss: bool = False,
-        session: Optional[str] = None,
-        session_key: Optional[str] = None,
-        token: Optional[str] = None,
+        session: str | None = None,
+        session_key: str | None = None,
+        token: str | None = None,
         default_timeout: float = DEFAULT_TIMEOUT,
     ):
         self.host = host
@@ -69,9 +69,11 @@ class Connection:
         # Auto-targets the document a script was launched from. An explicit
         # session (including "") always wins over the env var.
         self.session = session if session is not None else os.environ.get("GRIDSHELL_SESSION", "")
-        # Proves this process owns `session`, not just names it. See
-        # server.py's spawn_process()/handle_mcp().
-        self.session_key = session_key if session_key is not None else os.environ.get("GRIDSHELL_SESSION_KEY", "")
+        # Proves this process owns `session`, not just names it. Minted by
+        # Session.spawn(), checked by HostBridge.handle_mcp().
+        self.session_key = (
+            session_key if session_key is not None else os.environ.get("GRIDSHELL_SESSION_KEY", "")
+        )
         # Auto-pickup for a client launched inside a GridShell shell.
         self.token = token if token is not None else os.environ.get("GRIDSHELL_AUTH_TOKEN", "")
         self.default_timeout = default_timeout
@@ -102,7 +104,7 @@ class Connection:
             self._ws = ws_connect(self.url, legacy=True, max_size=MAX_WS_MESSAGE_BYTES)
         except Exception as exc:
             raise GridShellConnectionError(f"Could not connect to {self.url}: {exc}") from exc
-        # Credentials go first, before anything else, see server.py's router().
+        # Credentials go first, before anything else, see create_app's router.
         self._ws.send(json.dumps(self._connect_auth))
 
     def close(self) -> None:
@@ -119,7 +121,7 @@ class Connection:
     def __exit__(self, *exc_info) -> None:
         self.close()
 
-    def call(self, tool: str, params: Optional[dict] = None, timeout: Optional[float] = None) -> Any:
+    def call(self, tool: str, params: dict | None = None, timeout: float | None = None) -> Any:
         """Send one request envelope and block for its matching response.
 
         Raises GridShellConnectionError if not connected and connecting

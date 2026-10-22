@@ -1,14 +1,14 @@
 """GridShell's MCP relay - a stdio MCP server for any MCP-compatible agent
 (Claude Code, Antigravity, Codex, OpenCode etc.). Installed automatically with
-`pip install gridshell`, alongside server.py and the SheetsClient Python
-client. Run via the `gridshell-mcp` console command.
+`pip install gridshell`, alongside the server (gridshell-server) and the
+SheetsClient Python client. Run via the `gridshell-mcp` console command.
 
-Connects to server.py's /mcp, forwards MCP tool calls, correlates
-responses by id. Point this at whatever port/protocol/token server.py was
+Connects to the server's /mcp, forwards MCP tool calls, correlates
+responses by id. Point this at whatever port/protocol/token the server was
 started with via --port/--wss/--auth-token (and PORT/AUTH_TOKEN env vars)
-- server.py requires a token by default (auto-generated if --auth-token
+- the server requires a token by default (auto-generated if --auth-token
 isn't passed). Run from inside a spreadsheet's embedded terminal,
-this needs no manual token configuration at all. server.py hands the
+this needs no manual token configuration at all. The server hands the
 running shell GRIDSHELL_AUTH_TOKEN automatically, the same auto-pickup as
 GRIDSHELL_SESSION/GRIDSHELL_SESSION_KEY. For example:
 
@@ -21,19 +21,23 @@ and point your MCP config entry at it instead.
 
 Dependencies are installed automatically with `pip install gridshell`.
 """
+
 import asyncio
 import json
 import os
 import random
 import string
 import sys
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
 import mcp.types as types
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
+from websockets.asyncio.client import ClientConnection
 from websockets.asyncio.client import connect as ws_connect
 from websockets.exceptions import ConnectionClosed
-
 
 USAGE = """gridshell-mcp [--port N] [--wss] [--auth-token TOKEN]
 
@@ -46,7 +50,16 @@ USAGE = """gridshell-mcp [--port N] [--wss] [--auth-token TOKEN]
 """
 
 
-def resolve_flags():
+@dataclass(frozen=True)
+class Settings:
+    """What the command line and environment resolve to."""
+
+    port: int
+    use_wss: bool
+    auth_token: str | None
+
+
+def resolve_flags() -> Settings:
     argv = sys.argv[1:]
     use_wss = False
     # Hand-rolled: a handful of flags in a small copy-and-edit script,
@@ -63,17 +76,17 @@ def resolve_flags():
             use_wss = True
         elif arg in value_flags:
             if i + 1 >= len(argv):
-                sys.exit("%s requires a value" % arg)
+                sys.exit(f"{arg} requires a value")
             values[value_flags[arg]] = argv[i + 1]
             i += 1
         else:
-            sys.exit("Unknown option: %s" % arg)
+            sys.exit(f"Unknown option: {arg}")
         i += 1
     if "port" in values:
         try:
             port = int(values["port"])
         except ValueError:
-            sys.exit("--port must be a number, got %r" % values["port"])
+            sys.exit(f"--port must be a number, got {values['port']!r}")
     else:
         port = int(os.environ.get("PORT", 3000))
     auth_token = (
@@ -82,25 +95,29 @@ def resolve_flags():
         # Auto-pickup for a client launched inside a GridShell shell.
         or os.environ.get("GRIDSHELL_AUTH_TOKEN")
     )
-    return port, use_wss, auth_token
+    return Settings(port=port, use_wss=use_wss, auth_token=auth_token)
 
 
-def build_runtime_config():
-    # Called from run(), not at import. Importing this module could
-    # parse sys.argv and sys.exit() on a bogus one. Matches
-    # server.py's own resolve_flags(), called from run() there too.
-    port, use_wss, auth_token = resolve_flags()
-    # Set by server.py when launched inside a spreadsheet's embedded terminal
+def build_runtime_config() -> tuple[str, dict[str, Any]]:
+    # Called from main(), not at import. Importing this module could
+    # parse sys.argv and sys.exit() on a bogus one. The server's
+    # cli.resolve_flags() is called from run() for the same reason.
+    settings = resolve_flags()
+    # Set by the server when launched inside a spreadsheet's embedded terminal
     # - routes calls to that document. Unset when run standalone.
     session_id = os.environ.get("GRIDSHELL_SESSION", "")
-    # Proves this process owns session_id, not just names it. See server.py's
-    # spawn_process()/handle_mcp().
+    # Proves this process owns session_id, not just names it. Minted by
+    # Session.spawn(), checked by HostBridge.handle_mcp().
     session_key = os.environ.get("GRIDSHELL_SESSION_KEY", "")
-    scheme = "wss" if use_wss else "ws"
+    scheme = "wss" if settings.use_wss else "ws"
     # No query string - credentials travel as the first message instead (see
     # HostConnection.ensure_connected), not the URL.
-    url = "%s://localhost:%d/mcp" % (scheme, port)
-    connect_auth = {"token": auth_token, "session": session_id, "sessionKey": session_key}
+    url = f"{scheme}://localhost:{settings.port}/mcp"
+    connect_auth = {
+        "token": settings.auth_token,
+        "session": session_id,
+        "sessionKey": session_key,
+    }
     return url, connect_auth
 
 
@@ -111,12 +128,12 @@ BUDGET_MARGIN_MS = 30 * 1000
 # Extra margin for this process's own asyncio.wait_for, so it doesn't race
 # the server's own timeout message.
 CLIENT_MARGIN_MS = 20 * 1000
-# Matches server.py's DEFAULT_MAX_MESSAGE_BYTES, see transport.py's own
+# Matches the server's default (common.py), see transport.py's own
 # copy of this comment for why it reads $MAX_MESSAGE_MB too.
 MAX_WS_MESSAGE_BYTES = int(float(os.environ.get("MAX_MESSAGE_MB", 64)) * 1024 * 1024)
 
 
-def generate_id():
+def generate_id() -> str:
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=16))
 
 
@@ -125,28 +142,28 @@ class HostConnection:
     reconnects automatically on close, and correlates responses to calls by
     id."""
 
-    def __init__(self, url, connect_auth):
+    def __init__(self, url: str, connect_auth: dict[str, Any]) -> None:
         self.url = url
         self.connect_auth = connect_auth
-        self.ws = None
-        self.pending = {}  # id -> asyncio.Future
-        self.effective_timeout_ms = DEFAULT_TIMEOUT_MS
+        self.ws: ClientConnection | None = None
+        self.pending: dict[str, asyncio.Future[dict[str, Any]]] = {}  # call id -> reply
+        self.effective_timeout_ms: float = DEFAULT_TIMEOUT_MS
         self._connect_lock = asyncio.Lock()
 
-    async def ensure_connected(self):
+    async def ensure_connected(self) -> None:
         if self.ws is not None:
             return
         async with self._connect_lock:
             if self.ws is not None:
                 return
             self.ws = await ws_connect(self.url, max_size=MAX_WS_MESSAGE_BYTES)
-            # Credentials go first, before anything else, see server.py's router().
+            # Credentials go first, before anything else, see create_app's router.
             await self.ws.send(json.dumps(self.connect_auth))
             sys.stderr.write("[mcp-grid] Connected to terminal server\n")
             asyncio.create_task(self._read_loop())
             asyncio.create_task(self._fetch_batch_time_budget())
 
-    async def _read_loop(self):
+    async def _read_loop(self) -> None:
         ws = self.ws
         close_message = "Connection to terminal server was closed"
         try:
@@ -159,13 +176,13 @@ class HostConnection:
                 if fut is not None and not fut.done():
                     fut.set_result(m)
         except Exception as exc:
-            sys.stderr.write("[mcp-grid] WebSocket error: %s\n" % exc)
+            sys.stderr.write(f"[mcp-grid] WebSocket error: {exc}\n")
             # A rejected/missing token closes with code 1008 and a specific
-            # reason (server.py's router()). Surface it instead of a
+            # reason (create_app's router). Surface it instead of a
             # generic message that points at the socket layer, not the token.
             rcvd = getattr(exc, "rcvd", None) if isinstance(exc, ConnectionClosed) else None
             if rcvd is not None and rcvd.reason:
-                close_message = "Rejected by the server: %s" % rcvd.reason
+                close_message = f"Rejected by the server: {rcvd.reason}"
         finally:
             sys.stderr.write("[mcp-grid] Disconnected, retrying in 3s\n")
             if self.ws is ws:
@@ -176,7 +193,7 @@ class HostConnection:
             self.pending.clear()
             asyncio.create_task(self._reconnect_forever())
 
-    async def _reconnect_forever(self):
+    async def _reconnect_forever(self) -> None:
         # A single failed attempt could kill retries silently (the
         # exception goes nowhere). Loops until a connection actually lands.
         while self.ws is None:
@@ -184,34 +201,50 @@ class HostConnection:
             try:
                 await self.ensure_connected()
             except Exception as exc:
-                sys.stderr.write("[mcp-grid] Reconnect failed (%s), retrying in 3s\n" % exc)
+                sys.stderr.write(f"[mcp-grid] Reconnect failed ({exc}), retrying in 3s\n")
 
-    async def _fetch_batch_time_budget(self):
+    async def _fetch_batch_time_budget(self) -> None:
         # Replaces the DEFAULT_TIMEOUT_MS guess with the server's real budget.
         try:
             budget_ms = await self.call("getBatchTimeBudgetMs", {}, DEFAULT_TIMEOUT_MS)
         except Exception as exc:
-            sys.stderr.write("[mcp-grid] Could not fetch batch time budget, using default: %s\n" % exc)
+            sys.stderr.write(
+                f"[mcp-grid] Could not fetch batch time budget, using default: {exc}\n"
+            )
             return
         if isinstance(budget_ms, (int, float)) and budget_ms > 0:
             self.effective_timeout_ms = budget_ms + BUDGET_MARGIN_MS
 
-    async def call(self, tool_name, params, timeout_ms_override=None):
+    async def call(
+        self,
+        tool_name: str,
+        params: dict[str, Any] | None,
+        timeout_ms_override: float | None = None,
+    ) -> Any:
         await self.ensure_connected()
         if self.ws is None:
             raise RuntimeError("Not connected to terminal server")
-        server_timeout_ms = timeout_ms_override if timeout_ms_override is not None else self.effective_timeout_ms
+        server_timeout_ms = (
+            timeout_ms_override if timeout_ms_override is not None else self.effective_timeout_ms
+        )
         call_id = generate_id()
         fut = asyncio.get_running_loop().create_future()
         self.pending[call_id] = fut
-        await self.ws.send(json.dumps({
-            "id": call_id, "tool": tool_name, "params": params or {}, "timeoutMs": server_timeout_ms,
-        }))
+        await self.ws.send(
+            json.dumps(
+                {
+                    "id": call_id,
+                    "tool": tool_name,
+                    "params": params or {},
+                    "timeoutMs": server_timeout_ms,
+                }
+            )
+        )
         try:
             m = await asyncio.wait_for(fut, timeout=(server_timeout_ms + CLIENT_MARGIN_MS) / 1000)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self.pending.pop(call_id, None)
-            raise RuntimeError("Timeout waiting for response from Sheets")
+            raise RuntimeError("Timeout waiting for response from Sheets") from None
         if "error" in m:
             raise RuntimeError(m["error"])
         return m.get("result")
@@ -227,7 +260,7 @@ RUNBATCH_DESCRIPTION = (
     "Run one or more operations against the active Google Sheets spreadsheet, as data, not code: each op is a *chain* of method calls resolved in order starting from SpreadsheetApp. Example - set D14's formula:\n"
     '  {"ops": [{"chain": [{"method": "getActiveSheet", "args": []}, {"method": "getRange", "args": ["D14"]}, {"method": "setFormula", "args": ["=D14*(1+Assumptions!$B$5)"]}]}]}\n'
     "Submit many ops in one call, each run in order against the live sheet. A read op's result comes back in that op's slot; a write op's result is typically null. On partial failure, retry only from `nextIndex`, not the whole batch - `sideEffectsApplied`/`stepIndex`/`lastValue` tell you what already applied within the failed chain before assuming it was a no-op. No loops/arbitrary JS - express repetition as multiple ops, and prefer one whole-range call (getRange(\"A2:F26\").setValues([[...]])) over one op per cell/row.\n"
-    "Conditional formatting, charts, and pivot tables need a value *built* separately and passed in as an argument - via a { \"__chain\": [...] } marker, a DIFFERENT key from a top-level op's own plain \"chain\" - and some chart methods (e.g. setChartType) need a { \"__enum\": \"...\" } marker instead of a plain string. Call the runBatchGuide tool (no arguments) for the full pattern and worked examples before your first attempt at any of these, or after any runBatch error you don't understand.\n"
+    'Conditional formatting, charts, and pivot tables need a value *built* separately and passed in as an argument - via a { "__chain": [...] } marker, a DIFFERENT key from a top-level op\'s own plain "chain" - and some chart methods (e.g. setChartType) need a { "__enum": "..." } marker instead of a plain string. Call the runBatchGuide tool (no arguments) for the full pattern and worked examples before your first attempt at any of these, or after any runBatch error you don\'t understand.\n'
     "At most 500 ops per call."
 )
 
@@ -235,12 +268,12 @@ RUNBATCH_GUIDE = (
     "# runBatch usage guide: building values as arguments, existing-object lookups, enums, and worked examples for conditional formatting, charts, and pivot tables.\n\n"
     "## Building a value as an argument (__chain)\n"
     "Some methods (conditional formatting, charts, pivot tables) need a value built separately and passed in as an argument, not just the chain's own progressing target - e.g. a range object handed into addRange(), or a rule object handed into setConditionalFormatRules([...]). Use a { \"__chain\": [...] } marker in place of that argument - it's resolved as its own chain first, and the result is passed in as that argument. Nestable as deep as the builder pattern needs.\n\n"
-    "THIS IS NOT THE SAME KEY as a top-level op's own \"chain\" (no underscores). Mixing them up is the most common mistake: an argument object with \"chain\" instead of \"__chain\" is rejected with a clear error rather than silently doing nothing.\n\n"
+    'THIS IS NOT THE SAME KEY as a top-level op\'s own "chain" (no underscores). Mixing them up is the most common mistake: an argument object with "chain" instead of "__chain" is rejected with a clear error rather than silently doing nothing.\n\n'
     "setConditionalFormatRules/getConditionalFormatRules are sheet-level (replace/read the whole rule list), not range-level.\n\n"
     "Example - highlight B2:B10 red where the value exceeds 100:\n"
     '  {"ops": [{"chain": [{"method": "getActiveSheet", "args": []}, {"method": "setConditionalFormatRules", "args": [[{"__chain": [{"method": "newConditionalFormatRule", "args": []}, {"method": "whenNumberGreaterThan", "args": [100]}, {"method": "setBackground", "args": ["#ff0000"]}, {"method": "setRanges", "args": [[{"__chain": [{"method": "getActiveSheet", "args": []}, {"method": "getRange", "args": ["B2:B10"]}]}]]}, {"method": "build", "args": []}]}]]}]}]}\n\n'
     "## Acting on an existing object (index / chartId)\n"
-    "To act on a specific existing object already on the sheet (not one this call is creating), a chain step can be {\"index\": N} instead of {\"method\",\"args\"} - it indexes into the array the previous step returned, the same way sheet.getCharts()[0] would in ordinary code. There is no cross-call handle for these objects: list-and-inspect, then act by index in a follow-up call (re-fetch the array each time - indices aren't stable if something reorders it in between).\n\n"
+    'To act on a specific existing object already on the sheet (not one this call is creating), a chain step can be {"index": N} instead of {"method","args"} - it indexes into the array the previous step returned, the same way sheet.getCharts()[0] would in ordinary code. There is no cross-call handle for these objects: list-and-inspect, then act by index in a follow-up call (re-fetch the array each time - indices aren\'t stable if something reorders it in between).\n\n'
     "Example - read the title of the second chart on the active sheet:\n"
     '  {"ops": [{"chain": [{"method": "getActiveSheet", "args": []}, {"method": "getCharts", "args": []}, {"index": 1}, {"method": "getOptions", "args": []}, {"method": "get", "args": ["title"]}]}]}\n\n'
     "Charts specifically also have a real, stable id - {\"chartId\": \"...\"} finds the chart with that id in the previous step's array (more robust than index, since a chart's id doesn't change if others are added/removed/reordered). Read a chart's id with getChartId(). To modify an existing chart in place: resolve it (by index or chartId), call .modify(), make changes, then .build() - that alone does NOT save the change, chain a final getActiveSheet().updateChart(...) step with the built chart as its argument.\n\n"
@@ -248,7 +281,7 @@ RUNBATCH_GUIDE = (
     '  {"ops": [{"chain": [{"method": "getActiveSheet", "args": []}, {"method": "updateChart", "args": [{"__chain": [{"method": "getActiveSheet", "args": []}, {"method": "getCharts", "args": []}, {"chartId": "123456789"}, {"method": "modify", "args": []}, {"method": "setOption", "args": ["title", "Updated title"]}, {"method": "build", "args": []}]}]}]}]}\n\n'
     "(Cosmetic chart options - colors, fonts, stroke/fill - are Pro-tier-reserved and rejected on the free tier; structural options like the title above are not.)\n\n"
     "## Enum constants (__enum)\n"
-    "A few methods need an actual enum constant, not a JSON-representable value - e.g. EmbeddedChartBuilder.setChartType() rejects a plain string like \"COLUMN\" or even \"Charts.ChartType.COLUMN\" (still just a string either way). Use a { \"__enum\": \"Charts.ChartType.COLUMN\" } marker (double underscore, same convention as __chain) in place of that argument - a bare \"enum\" key without the underscores is rejected with a clear error rather than silently doing nothing.\n\n"
+    'A few methods need an actual enum constant, not a JSON-representable value - e.g. EmbeddedChartBuilder.setChartType() rejects a plain string like "COLUMN" or even "Charts.ChartType.COLUMN" (still just a string either way). Use a { "__enum": "Charts.ChartType.COLUMN" } marker (double underscore, same convention as __chain) in place of that argument - a bare "enum" key without the underscores is rejected with a clear error rather than silently doing nothing.\n\n'
     "Supported paths:\n"
     "- Charts.ChartType.*: AREA, BAR, BUBBLE, CANDLESTICK, COLUMN, COMBO, GAUGE, GEO, HISTOGRAM, LINE, ORG, PIE, RADAR, SCATTER, SPARKLINE, STEPPED_AREA, TABLE, TIMELINE, TREEMAP, WATERFALL\n"
     "- SpreadsheetApp.PivotTableSummarizeFunction.*: SUM, COUNTA, COUNT, COUNTUNIQUE, AVERAGE, MAX, MIN, MEDIAN, PRODUCT, STDEV, STDEVP, VAR, VARP, CUSTOM\n\n"
@@ -262,7 +295,7 @@ RUNBATCH_GUIDE = (
     '{"chain": [{"method": "getActiveSheet", "args": []}, {"method": "getRange", "args": ["A1:C6"]}, {"method": "createPivotTable", "args": [{"__chain": [{"method": "getActiveSheet", "args": []}, {"method": "getRange", "args": ["E1"]}]}]}]}, '
     '{"chain": [{"method": "getActiveSheet", "args": []}, {"method": "getPivotTables", "args": []}, {"index": 0}, {"method": "addRowGroup", "args": [1]}]}, '
     '{"chain": [{"method": "getActiveSheet", "args": []}, {"method": "getPivotTables", "args": []}, {"index": 0}, {"method": "addPivotValue", "args": [3, {"__enum": "SpreadsheetApp.PivotTableSummarizeFunction.SUM"}]}]}'
-    ']}\n'
+    "]}\n"
 )
 
 TOOLS = [
@@ -284,10 +317,22 @@ TOOLS = [
                                 "items": {
                                     "type": "object",
                                     "properties": {
-                                        "method": {"type": "string", "description": "Method name to call on the current target."},
-                                        "args": {"type": "array", "description": "Arguments for this call, in order."},
-                                        "index": {"type": "number", "description": "Index into the array the previous step returned (e.g. into getCharts()'s result)."},
-                                        "chartId": {"type": "string", "description": "Find the chart with this id in the array the previous step returned (read via getChartId())."},
+                                        "method": {
+                                            "type": "string",
+                                            "description": "Method name to call on the current target.",
+                                        },
+                                        "args": {
+                                            "type": "array",
+                                            "description": "Arguments for this call, in order.",
+                                        },
+                                        "index": {
+                                            "type": "number",
+                                            "description": "Index into the array the previous step returned (e.g. into getCharts()'s result).",
+                                        },
+                                        "chartId": {
+                                            "type": "string",
+                                            "description": "Find the chart with this id in the array the previous step returned (read via getChartId()).",
+                                        },
                                     },
                                 },
                             },
@@ -311,7 +356,10 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "range": {"type": "string", "description": 'A1 notation, e.g. "A1:C10".'},
-                "sheet": {"type": "string", "description": "Sheet name. Defaults to the active sheet if omitted."},
+                "sheet": {
+                    "type": "string",
+                    "description": "Sheet name. Defaults to the active sheet if omitted.",
+                },
             },
             "required": ["range"],
         },
@@ -322,25 +370,37 @@ TOOLS = [
         input_schema={
             "type": "object",
             "properties": {
-                "range": {"type": "string", "description": 'A1 notation, e.g. "A1:C10" - must match the shape of values.'},
+                "range": {
+                    "type": "string",
+                    "description": 'A1 notation, e.g. "A1:C10" - must match the shape of values.',
+                },
                 "values": {
                     "type": "array",
                     "description": "2D array of rows, e.g. [[1,2],[3,4]].",
                     "items": {"type": "array"},
                 },
-                "sheet": {"type": "string", "description": "Sheet name. Defaults to the active sheet if omitted."},
+                "sheet": {
+                    "type": "string",
+                    "description": "Sheet name. Defaults to the active sheet if omitted.",
+                },
             },
             "required": ["range", "values"],
         },
     ),
     types.Tool(
         name="appendRow",
-        description='Append one row of values to the end of the active sheet\'s data (or a named sheet) - Sheets figures out where the data currently ends and adds the row right after it. Equivalent to runBatch\'s appendRow(values) chain - a shortcut since finding "the next empty row" would otherwise take an extra read op.',
+        description="Append one row of values to the end of the active sheet's data (or a named sheet) - Sheets figures out where the data currently ends and adds the row right after it. Equivalent to runBatch's appendRow(values) chain - a shortcut since finding \"the next empty row\" would otherwise take an extra read op.",
         input_schema={
             "type": "object",
             "properties": {
-                "values": {"type": "array", "description": 'One row\'s values in order, e.g. ["Widget", 12, "2026-09-03"].'},
-                "sheet": {"type": "string", "description": "Sheet name. Defaults to the active sheet if omitted."},
+                "values": {
+                    "type": "array",
+                    "description": 'One row\'s values in order, e.g. ["Widget", 12, "2026-09-03"].',
+                },
+                "sheet": {
+                    "type": "string",
+                    "description": "Sheet name. Defaults to the active sheet if omitted.",
+                },
             },
             "required": ["values"],
         },
@@ -348,7 +408,7 @@ TOOLS = [
 ]
 
 # Set by main() before the server handles any tool calls.
-connection = None
+connection: HostConnection | None = None
 _TOOLS_BY_NAME = {tool.name: tool for tool in TOOLS}
 
 # The MCP SDK's low-level Server doesn't validate arguments against a
@@ -356,7 +416,7 @@ _TOOLS_BY_NAME = {tool.name: tool for tool in TOOLS}
 # required fields and each top-level property's declared type. Doesn't
 # recurse into op/chain shape, as the client
 # already rejects a malformed op with a proper envelope.
-_JSON_TYPE_CHECKS = {
+_JSON_TYPE_CHECKS: dict[str, Callable[[Any], bool]] = {
     "string": lambda v: isinstance(v, str),
     "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
     "boolean": lambda v: isinstance(v, bool),
@@ -365,12 +425,12 @@ _JSON_TYPE_CHECKS = {
 }
 
 
-def _validate_against_schema(schema, args):
+def _validate_against_schema(schema: dict[str, Any], args: Any) -> str | None:
     if not isinstance(args, dict):
-        return "arguments must be a JSON object, got %s" % type(args).__name__
+        return f"arguments must be a JSON object, got {type(args).__name__}"
     for field in schema.get("required", []):
         if field not in args:
-            return "missing required field %r" % field
+            return f"missing required field {field!r}"
     properties = schema.get("properties", {})
     for field, value in args.items():
         prop_schema = properties.get(field)
@@ -379,15 +439,15 @@ def _validate_against_schema(schema, args):
         expected_type = prop_schema.get("type")
         check = _JSON_TYPE_CHECKS.get(expected_type)
         if check is not None and not check(value):
-            return "field %r must be of type %r, got %s" % (field, expected_type, type(value).__name__)
+            return f"field {field!r} must be of type {expected_type!r}, got {type(value).__name__}"
     return None
 
 
-async def on_list_tools(ctx, params):
+async def on_list_tools(ctx: Any, params: Any) -> types.ListToolsResult:
     return types.ListToolsResult(tools=TOOLS)
 
 
-async def on_call_tool(ctx, params):
+async def on_call_tool(ctx: Any, params: Any) -> types.CallToolResult:
     name = params.name
     args = params.arguments or {}
     # Static reference text, not a spreadsheet operation - answered locally,
@@ -399,7 +459,7 @@ async def on_call_tool(ctx, params):
         validation_error = _validate_against_schema(tool.input_schema, args)
         if validation_error is not None:
             return types.CallToolResult(
-                content=[types.TextContent(type="text", text="Error: %s" % validation_error)],
+                content=[types.TextContent(type="text", text=f"Error: {validation_error}")],
                 is_error=True,
             )
     try:
@@ -412,16 +472,18 @@ async def on_call_tool(ctx, params):
             text = json.dumps(result, indent=2)
         return types.CallToolResult(content=[types.TextContent(type="text", text=text)])
     except Exception as exc:
-        return types.CallToolResult(content=[types.TextContent(type="text", text="Error: %s" % exc)], is_error=True)
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=f"Error: {exc}")], is_error=True
+        )
 
 
-async def main():
+async def main() -> None:
     global connection
     url, connect_auth = build_runtime_config()
     connection = HostConnection(url, connect_auth)
     server = Server(
         "gridshell-mcp",
-        version="1.0.0b4",
+        version="1.0.0b5",
         on_list_tools=on_list_tools,
         on_call_tool=on_call_tool,
     )
@@ -429,7 +491,7 @@ async def main():
         await server.run(read_stream, write_stream, server.create_initialization_options())
 
 
-def run():
+def run() -> None:
     """Entry point for the `gridshell-mcp` console command."""
     try:
         asyncio.run(main())

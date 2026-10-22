@@ -1,5 +1,5 @@
 """Conformance suite for the /terminal + /host + /mcp wire protocol.
-Tests server.py as a black box over real WebSocket connections (never
+Tests the server as a black box over real WebSocket connections (never
 touches TerminalHub/HostBridge internals beyond what create_app()
 exposes for assertions), so it
 validates both a future reimplementation AND that a refactor didn't
@@ -8,10 +8,9 @@ checked against schemas/terminal-server-message.schema.json, and the
 /host + /mcp envelopes against their own schemas, so a shape regression
 fails here too.
 
-Uses a fake PtyProcess (monkeypatched over pywinpty), not a real shell. 
-Mirrors pywinpty's own interface (spawn/write/setwinsize/terminate/read), 
-see server.py's own _shell_display_path/spawn_process for the real interface 
-this stands infor.
+Uses a fake PtyProcess, injected through create_app(spawn=...), not a real
+shell. It mirrors pywinpty's own interface (spawn/write/setwinsize/terminate/
+read); see shell.py's spawn_shell for the real one.
 
 Run: pip install -e ".[dev]"
      pytest tests/test_conformance.py
@@ -30,13 +29,17 @@ import pytest
 from websockets.asyncio.server import serve
 from websockets.sync.client import connect as ws_connect
 
-from gridshell import server as server_module
+from gridshell.server import app as app_module
+from gridshell.server import cli as cli_module
+from gridshell.server import common as common_module
+from gridshell.server.terminal import session as session_module
+from gridshell.server.terminal import shell as shell_module
 
 SCHEMA_DIR = os.path.join(os.path.dirname(__file__), "..", "schemas")
 
 
 def load_schema(name):
-    with open(os.path.join(SCHEMA_DIR, name), "r", encoding="utf-8") as f:
+    with open(os.path.join(SCHEMA_DIR, name), encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -74,6 +77,7 @@ class FakePtyProcess:
 
     def __init__(self):
         self.killed = False
+        self.terminate_calls = 0
         self.resize_calls = []
         self._queue = queue.Queue()
         FakePtyProcess.instances.append(self)
@@ -89,6 +93,7 @@ class FakePtyProcess:
         self.resize_calls.append((cols, rows))
 
     def terminate(self, force=False):
+        self.terminate_calls += 1
         self.killed = True
         self._queue.put(None)  # unblocks a pending read() with EOFError
         return True
@@ -109,12 +114,13 @@ def reset_fake_instances():
 # ── Test server harness ─────────────────────────────────────────────────
 class ServerHandle:
     def __init__(self, idle_hours=12, buffer_mb=8, required_token=None,
-                 allowed_origin_suffixes=(), max_message_bytes=None):
+                 allowed_origin_suffixes=(), max_message_bytes=None, spawn=None):
         self.idle_hours = idle_hours
         self.buffer_mb = buffer_mb
         self.required_token = required_token
         self.allowed_origin_suffixes = allowed_origin_suffixes
         self.max_message_bytes = max_message_bytes
+        self.spawn = spawn or FakePtyProcess.spawn
         self.port = None
         self.terminal_hub = None
         self.host_bridge = None
@@ -133,11 +139,12 @@ class ServerHandle:
             self._loop = loop
 
             async def boot():
-                router, hub, bridge = server_module.create_app(
+                router, hub, bridge = app_module.create_app(
                     self.idle_hours, self.buffer_mb,
                     required_token=self.required_token,
                     allowed_origin_suffixes=self.allowed_origin_suffixes,
                     max_message_bytes=self.max_message_bytes,
+                    spawn=self.spawn,
                 )
                 self.terminal_hub = hub
                 self.host_bridge = bridge
@@ -146,7 +153,7 @@ class ServerHandle:
                 serve_kwargs = {}
                 if self.max_message_bytes is not None:
                     serve_kwargs["max_size"] = self.max_message_bytes
-                self._ws_server = await serve(router, "localhost", 0, **serve_kwargs)
+                self._ws_server = await serve(router, "127.0.0.1", 0, **serve_kwargs)
                 self.port = self._ws_server.sockets[0].getsockname()[1]
                 ready.set()
                 await self._ws_server.wait_closed()
@@ -185,7 +192,7 @@ class ServerHandle:
         kwargs = {"legacy": True}
         if origin is not None:
             kwargs["origin"] = origin
-        ws = ws_connect("ws://localhost:%d%s" % (self.port, path), **kwargs)
+        ws = ws_connect("ws://127.0.0.1:%d%s" % (self.port, path), **kwargs)
         self._sockets.append(ws)
         return ws
 
@@ -206,8 +213,7 @@ class ServerHandle:
 
 
 @pytest.fixture
-def server(monkeypatch):
-    monkeypatch.setattr(server_module, "PtyProcess", FakePtyProcess)
+def server():
     handle = ServerHandle()
     handle.start()
     yield handle
@@ -215,11 +221,10 @@ def server(monkeypatch):
 
 
 @pytest.fixture
-def make_server(monkeypatch):
+def make_server():
     # Factory version of `server` above, for tests that need a
     # non-default ServerHandle (a token, an origin allow-list, a message
     # size cap). Closes every handle it created, same as `server` does.
-    monkeypatch.setattr(server_module, "PtyProcess", FakePtyProcess)
     handles = []
 
     def _make(**kwargs):
@@ -231,7 +236,6 @@ def make_server(monkeypatch):
     yield _make
     for handle in handles:
         handle.close()
-
 
 # ── /terminal test client ────────────────────────────────────────────────
 class TerminalClient:
@@ -340,16 +344,16 @@ def test_live_output_send_queue_is_bounded_and_drops_oldest(server):
     client.send({"type": "resize", "cols": 80, "rows": 24})
     client.wait_for_type("spawned")
 
-    session = server.terminal_hub.sessions["backpressure-test"]
-    assert session["send_queue"].maxlen == server_module.OUTPUT_QUEUE_MAX_CHUNKS
+    session = server.terminal_hub.table.sessions["backpressure-test"]
+    assert session.send_queue.maxlen == session_module.OUTPUT_QUEUE_MAX_CHUNKS
 
-    with session["send_queue_lock"]:
-        for i in range(server_module.OUTPUT_QUEUE_MAX_CHUNKS + 50):
-            session["send_queue"].append("chunk-%d" % i)
-        remaining = list(session["send_queue"])
-    assert len(remaining) == server_module.OUTPUT_QUEUE_MAX_CHUNKS
+    with session.send_queue_lock:
+        for i in range(session_module.OUTPUT_QUEUE_MAX_CHUNKS + 50):
+            session.send_queue.append("chunk-%d" % i)
+        remaining = list(session.send_queue)
+    assert len(remaining) == session_module.OUTPUT_QUEUE_MAX_CHUNKS
     assert remaining[0] == "chunk-50"
-    assert remaining[-1] == "chunk-%d" % (server_module.OUTPUT_QUEUE_MAX_CHUNKS + 49)
+    assert remaining[-1] == "chunk-%d" % (session_module.OUTPUT_QUEUE_MAX_CHUNKS + 49)
 
 
 def test_second_connection_to_same_session_evicts_first(server):
@@ -499,8 +503,8 @@ def test_reconcile_closes_sessions_the_client_no_longer_lists_and_spawns(server)
 
     assert not FakePtyProcess.instances[0].killed
     assert FakePtyProcess.instances[1].killed
-    assert "docR-2" in server.terminal_hub.terminated
-    assert "docR-2" not in server.terminal_hub.sessions
+    assert "docR-2" in server.terminal_hub.table.terminated
+    assert "docR-2" not in server.terminal_hub.table.sessions
 
 
 def test_reconcile_still_refuses_when_every_session_is_listed(server):
@@ -580,7 +584,7 @@ def test_hello_comes_before_spawned_and_before_attached(server):
     first.wait_for_type("spawned")
     types = [m["type"] for m in first.messages]
     assert types.index("hello") < types.index("spawned")
-    assert first.messages[types.index("hello")]["protocol"] == server_module.PROTOCOL_LEVEL
+    assert first.messages[types.index("hello")]["protocol"] == common_module.PROTOCOL_LEVEL
     first.ws.close()
 
     second = TerminalClient(server.connect("/terminal", auth=auth))
@@ -604,6 +608,8 @@ def test_no_hello_without_the_capability_or_for_a_refused_spawn(server):
     with pytest.raises(Exception):
         ws3.recv(timeout=2)
     assert ws3.close_code == 1013
+
+
 
 
 def _output_ending_with(text):
@@ -653,22 +659,21 @@ def test_replay_for_a_client_without_the_timeline_capability_has_no_size_message
 
 
 def test_resizing_to_the_current_size_records_no_marker():
-    session = {"buffer": [], "buffer_bytes": 0, "buffer_lock": threading.Lock(), "cur_size": (80, 24)}
-    server_module._record_size(session, 80, 24)
-    assert session["buffer"] == []
-    server_module._record_size(session, 100, 30)
-    assert session["buffer"] == [(100, 30)]
+    replay = session_module.ReplayBuffer(8, 80, 24)
+    replay.record_size(80, 24)
+    assert replay.items == []
+    replay.record_size(100, 30)
+    assert replay.items == [(100, 30)]
 
 
 def test_trimming_the_buffer_keeps_the_size_the_kept_data_was_written_at():
-    session = {"buffer": [], "buffer_bytes": 0, "buffer_max_bytes": 8, "buffer_lock": threading.Lock(),
-               "handshake_done": True, "cur_size": (80, 24), "base_size": (80, 24)}
-    server_module._ingest_into_buffer(session, "aaaaaa")
-    server_module._record_size(session, 100, 30)
-    server_module._ingest_into_buffer(session, "bbbbbb")
-    server_module._ingest_into_buffer(session, "cccccc")
-    assert session["base_size"] == (100, 30)
-    assert server_module._replay_messages(session, True, 1024) == [
+    replay = session_module.ReplayBuffer(8, 80, 24)
+    replay.ingest("aaaaaa")
+    replay.record_size(100, 30)
+    replay.ingest("bbbbbb")
+    replay.ingest("cccccc")
+    assert replay.base_size == (100, 30)
+    assert replay.messages(True, 1024) == [
         {"type": "resized", "cols": 100, "rows": 30},
         {"type": "output", "data": "cccccc"},
     ]
@@ -691,6 +696,43 @@ def test_idle_session_killed_after_window_then_reconnect_spawns_fresh(server):
     client_b.send({"type": "resize", "cols": 80, "rows": 24})
     client_b.wait_for_type("spawned")  # not "attached" proves the old session is gone
     assert len(FakePtyProcess.instances) == 2
+
+
+def test_reattaching_over_a_live_viewer_leaves_no_idle_timer(server):
+    # The evicted viewer's socket ends while attach() is still replacing it, and
+    # that must not leave a countdown running on a session that has a viewer.
+    auth = {"session": "evict-timer", "hostKey": "hk-evict"}
+    client_a = TerminalClient(server.connect("/terminal", auth=auth))
+    client_a.send({"type": "resize", "cols": 80, "rows": 24})
+    client_a.wait_for_type("spawned")
+
+    client_b = TerminalClient(server.connect("/terminal", auth=auth))
+    client_b.wait_for_type("attached")
+    time.sleep(0.2)
+
+    session = server.terminal_hub.table.sessions["evict-timer"]
+    assert session.ws is not None
+    assert session.idle_timer is None
+
+
+def test_terminated_session_is_not_idle_killed_later(server, capsys):
+    # Reattach over a live viewer, then terminate from a control connection
+    # (the sidebar's Kill): no countdown may outlive the terminate.
+    auth = {"session": "stale-timer", "hostKey": "hk-stale"}
+    path = "/terminal?idleHours=0.00003"  # ~108ms
+    client_a = TerminalClient(server.connect(path, auth=auth))
+    client_a.send({"type": "resize", "cols": 80, "rows": 24})
+    client_a.wait_for_type("spawned")
+    client_b = TerminalClient(server.connect(path, auth=auth))
+    client_b.wait_for_type("attached")
+
+    control = TerminalClient(server.connect(path, auth={**auth, "caps": ["control"]}))
+    control.send({"type": "terminate"})
+    control.wait_for_type("terminated")
+    capsys.readouterr()
+    time.sleep(0.5)
+
+    assert "idle-killed" not in capsys.readouterr().out
 
 
 def test_terminate_deletes_session_immediately_bypassing_idle_grace(server):
@@ -731,10 +773,10 @@ def test_tolerate_invalid_utf8_swaps_in_a_replacing_decoder():
     with pytest.raises(UnicodeDecodeError):
         proc.decoder.decode(b"ab\xd1x")
     proc.decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
-    server_module._tolerate_invalid_utf8(proc)
+    shell_module._tolerate_invalid_utf8(proc)
     assert proc.decoder.decode(b"ab\xd1x") == "ab�x"
     # No decoder attribute (pywinpty) is left alone.
-    server_module._tolerate_invalid_utf8(object())
+    shell_module._tolerate_invalid_utf8(object())
 
 
 def test_reader_error_kills_the_process_instead_of_orphaning_it(server, monkeypatch):
@@ -747,7 +789,7 @@ def test_reader_error_kills_the_process_instead_of_orphaning_it(server, monkeypa
                 raise EOFError("closed")
             return item
 
-    monkeypatch.setattr(server_module, "PtyProcess", BrokenReadPty)
+    monkeypatch.setattr(server.terminal_hub, "spawn_fn", BrokenReadPty.spawn)
     client = TerminalClient(server.connect("/terminal", auth={"session": "reader-error-test"}))
     client.send({"type": "resize", "cols": 80, "rows": 24})
     client.wait_for_type("spawned")
@@ -784,6 +826,88 @@ def test_terminate_with_wrong_host_key_is_rejected_and_never_acked(server):
     assert FakePtyProcess.instances[0].killed is False
 
 
+# ── control connections ("control" in the auth frame's caps) ─────────────
+
+def received_types(ws, until, timeout=3.0):
+    # The types of what a raw socket receives, up to and including `until`.
+    types = []
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            types.append(json.loads(ws.recv(timeout=0.3))["type"])
+        except TimeoutError:
+            continue
+        except Exception:
+            break
+        if types[-1] == until:
+            break
+    return types
+
+
+def test_control_terminate_gets_only_the_ack_and_evicts_the_open_dialog(server):
+    auth = {"session": "control-term", "hostKey": "hk-control"}
+    dialog = TerminalClient(server.connect("/terminal", auth=auth))
+    dialog.send({"type": "resize", "cols": 80, "rows": 24})
+    dialog.wait_for_type("spawned")
+    dialog.send({"type": "input", "data": "something-to-replay"})
+    dialog.wait_for(lambda m: m.get("type") == "output" and m.get("data") == "something-to-replay")
+
+    control = server.connect("/terminal", auth={**auth, "caps": ["control", "hello", "timeline"]})
+    control.send(json.dumps({"type": "terminate"}))
+    # No hello, attached or replay: it never viewed the session.
+    assert received_types(control, until="terminated") == ["terminated"]
+    dialog.wait_for_type("evicted")
+    assert FakePtyProcess.instances[0].killed is True
+
+
+def test_control_connection_with_wrong_host_key_is_rejected(server):
+    auth = {"session": "control-key", "hostKey": "the-real-key"}
+    dialog = TerminalClient(server.connect("/terminal", auth=auth))
+    dialog.send({"type": "resize", "cols": 80, "rows": 24})
+    dialog.wait_for_type("spawned")
+
+    control = server.connect("/terminal", auth={**auth, "hostKey": "guessed", "caps": ["control"]})
+    control.send(json.dumps({"type": "terminate"}))
+    with pytest.raises(Exception):
+        control.recv(timeout=2)
+    assert control.close_code == 1008
+    assert FakePtyProcess.instances[0].killed is False
+
+
+def test_control_connection_cannot_spawn_a_session_and_ignores_other_messages(server):
+    control = server.connect("/terminal", auth={"session": "control-nospawn", "caps": ["control"]})
+    control.send(json.dumps({"type": "resize", "cols": 80, "rows": 24}))
+    control.send(json.dumps({"type": "input", "data": "x"}))
+    # The terminate that follows is answered, so the two above were handled first.
+    control.send(json.dumps({"type": "terminate"}))
+    assert received_types(control, until="terminated") == ["terminated"]
+    assert FakePtyProcess.instances == []
+
+
+def test_control_connection_does_not_replace_the_viewer_or_start_the_idle_timer(server):
+    auth = {"session": "control-quiet", "hostKey": "hk-quiet"}
+    dialog = TerminalClient(server.connect("/terminal", auth=auth))
+    dialog.send({"type": "resize", "cols": 80, "rows": 24})
+    dialog.wait_for_type("spawned")
+
+    control = server.connect("/terminal", auth={**auth, "caps": ["control"]})
+    control.close()
+    time.sleep(0.2)
+    session = server.terminal_hub.table.sessions["control-quiet"]
+    assert session.ws is not None  # still the dialog's socket
+    assert session.idle_timer is None
+    dialog.send({"type": "input", "data": "still-mine"})
+    dialog.wait_for(lambda m: m.get("type") == "output" and m.get("data") == "still-mine")
+
+
+def test_message_with_a_non_string_type_is_ignored(server):
+    client = TerminalClient(server.connect("/terminal", auth={"session": "odd-type"}))
+    client.send({"type": ["resize"]})
+    client.send({"type": {"a": 1}})
+    client.send({"type": "resize", "cols": 80, "rows": 24})
+    client.wait_for_type("spawned")
+
+
 # ── /host + /mcp tests ────────────────────────────────────────────────────
 #
 # An explicit /mcp ?session=... connection is gated on a matching
@@ -799,7 +923,7 @@ def host_auth(session):
 
 def spawn_terminal_session(handle, session):
     """Spawns a fake shell for `session` via /terminal so its real,
-    server-minted session_key exists in terminal_hub.sessions, and returns
+    server-minted session_key exists in terminal_hub.table.sessions, and returns
     (ws, session_key). Leaves the /terminal connection open, some tests
     reuse it (e.g. to send "terminate")."""
     auth = dict(host_auth(session))
@@ -807,7 +931,7 @@ def spawn_terminal_session(handle, session):
     ws.send(json.dumps({"type": "resize", "cols": 80, "rows": 24}))
     msg = json.loads(ws.recv(timeout=2))
     assert msg["type"] == "spawned"
-    return ws, handle.terminal_hub.sessions[session]["session_key"]
+    return ws, handle.terminal_hub.table.sessions[session].session_key
 
 
 def mcp_auth(session, session_key):
@@ -935,9 +1059,9 @@ def test_queued_call_fails_fast_when_its_shell_is_explicitly_terminated(server):
 
 
 # ── Origin checks ────────────────────────────────────────────────────────
-# A WebSocket handshake is accepted at the protocol level before router()
-# runs, so a rejection here is a close frame the client sees only once it
-# tries to read/write, not a failed connect(), see router()'s own comment.
+# A WebSocket handshake is accepted at the protocol level before the router
+# (app.py) runs, so a rejection here is a close frame the client sees only
+# once it tries to read/write, not a failed connect().
 
 def test_origin_from_apps_script_is_allowed_by_default(server):
     ws = server.connect("/terminal", origin="https://n-abc123.script.googleusercontent.com",
@@ -977,7 +1101,7 @@ def test_allow_origin_flag_extends_the_allowlist(make_server):
 def test_allowed_origin_suffix_has_a_dot_boundary_and_allows_the_bare_host(make_server):
     # A ".example.com" suffix must not also match "evilexample.com",
     # but should match both "example.com" itself and "sub.example.com".
-    is_allowed = server_module._is_allowed_origin
+    is_allowed = app_module._is_allowed_origin
     suffixes = (".example.com",)
     assert is_allowed("https://evilexample.com", suffixes) is False
     assert is_allowed("https://example.com", suffixes) is True
@@ -985,8 +1109,8 @@ def test_allowed_origin_suffix_has_a_dot_boundary_and_allows_the_bare_host(make_
 
 
 # ── Auth token ─────────────────────────────────────────────────────────
-# Sent as the first message on the connection, see router()'s
-# comment, not a query string or an Authorization header. A reverse proxy
+# Sent as the first message on the connection, see create_app's
+# router, not a query string or an Authorization header. A reverse proxy
 # never sees it, since it only ever logs the handshake request line.
 
 def test_correct_token_is_accepted(make_server):
@@ -1043,7 +1167,7 @@ def test_malformed_first_message_is_rejected_1008(server):
 def test_no_first_message_times_out_and_is_rejected_1008(server):
     ws = server.connect_raw("/terminal")
     with pytest.raises(Exception):
-        ws.recv(timeout=7)  # past router()'s own 5s auth-frame wait
+        ws.recv(timeout=7)  # past the router's own 5s auth-frame wait
     assert ws.close_code == 1008
 
 
@@ -1084,7 +1208,7 @@ def test_oversized_frame_fails_the_call_fast_with_a_clear_reason_not_timeout(mak
 def test_mcp_correct_session_key_is_accepted(server):
     session = "key-ok-test"
     spawn_terminal_session(server, session)
-    session_key = server.terminal_hub.sessions[session]["session_key"]
+    session_key = server.terminal_hub.table.sessions[session].session_key
     host_ws = server.connect("/host", auth=host_auth(session))
     mcp_ws = server.connect("/mcp", auth=mcp_auth(session, session_key))
 
@@ -1128,7 +1252,7 @@ def test_mcp_unknown_session_is_rejected_even_with_a_guessed_key(server):
 # ── Host-key gating on /host ───────────────────────────────────────────────
 # /host requires the same kind of per-spawn secret /mcp already
 # checks, except this one is minted client-side and handed to the
-# server via /terminal's auth frame, see server.py's router()/HostBridge.
+# server via /terminal's auth frame, see create_app's router and HostBridge.
 
 def test_host_wrong_hostkey_is_rejected_1008(server):
     session = "host-key-wrong-test"
@@ -1160,7 +1284,7 @@ def test_host_unspawned_session_gets_a_retryable_close_not_1008(server):
 def test_host_correct_hostkey_is_accepted(server):
     session = "host-key-ok-test"
     spawn_terminal_session(server, session)
-    mcp_ws = server.connect("/mcp", auth=mcp_auth(session, server.terminal_hub.sessions[session]["session_key"]))
+    mcp_ws = server.connect("/mcp", auth=mcp_auth(session, server.terminal_hub.table.sessions[session].session_key))
     host_ws = server.connect("/host", auth=host_auth(session))
 
     mcp_ws.send(json.dumps({"id": "hk1", "tool": "testTool"}))
@@ -1219,8 +1343,8 @@ def test_buffer_mb_param_is_clamped_to_the_configured_ceiling(make_server):
     ws = handle.connect("/terminal?bufferMb=999999", auth={"session": "clamp-buf"})
     ws.send(json.dumps({"type": "resize", "cols": 80, "rows": 24}))
     json.loads(ws.recv(timeout=2))
-    session = handle.terminal_hub.sessions["clamp-buf"]
-    assert session["buffer_max_bytes"] == 1 * 1024 * 1024
+    session = handle.terminal_hub.table.sessions["clamp-buf"]
+    assert session.replay.max_bytes == 1 * 1024 * 1024
 
 
 def test_idle_hours_param_is_clamped_to_the_configured_ceiling(make_server):
@@ -1228,8 +1352,8 @@ def test_idle_hours_param_is_clamped_to_the_configured_ceiling(make_server):
     ws = handle.connect("/terminal?idleHours=876000", auth={"session": "clamp-idle"})
     ws.send(json.dumps({"type": "resize", "cols": 80, "rows": 24}))
     json.loads(ws.recv(timeout=2))
-    session = handle.terminal_hub.sessions["clamp-idle"]
-    assert session["idle_kill_ms"] == 1 * 60 * 60 * 1000
+    session = handle.terminal_hub.table.sessions["clamp-idle"]
+    assert session.idle_kill_ms == 1 * 60 * 60 * 1000
 
 
 def test_idle_hours_zero_means_explicit_zero_grace_not_no_override(make_server):
@@ -1240,8 +1364,8 @@ def test_idle_hours_zero_means_explicit_zero_grace_not_no_override(make_server):
     ws = handle.connect("/terminal?idleHours=0", auth={"session": "zero-idle"})
     ws.send(json.dumps({"type": "resize", "cols": 80, "rows": 24}))
     json.loads(ws.recv(timeout=2))
-    session = handle.terminal_hub.sessions["zero-idle"]
-    assert session["idle_kill_ms"] == 0
+    session = handle.terminal_hub.table.sessions["zero-idle"]
+    assert session.idle_kill_ms == 0
 
 
 def test_idle_hours_negative_falls_back_to_the_server_default(make_server):
@@ -1249,8 +1373,8 @@ def test_idle_hours_negative_falls_back_to_the_server_default(make_server):
     ws = handle.connect("/terminal?idleHours=-5", auth={"session": "neg-idle"})
     ws.send(json.dumps({"type": "resize", "cols": 80, "rows": 24}))
     json.loads(ws.recv(timeout=2))
-    session = handle.terminal_hub.sessions["neg-idle"]
-    assert session["idle_kill_ms"] == 1 * 60 * 60 * 1000
+    session = handle.terminal_hub.table.sessions["neg-idle"]
+    assert session.idle_kill_ms == 1 * 60 * 60 * 1000
 
 
 # ── CLI refuse-to-start guards + --help ────────────────────────────────────
@@ -1349,18 +1473,18 @@ def test_cli_guard(args, exits_nonzero, must_contain, must_not_contain):
 def test_default_token_is_generated_and_persisted(tmp_path, monkeypatch):
     token_path = tmp_path / "token"
     monkeypatch.setenv("GRIDSHELL_TOKEN_PATH", str(token_path))
-    token1 = server_module._load_or_create_default_token(None, False, False)
+    token1 = cli_module.load_or_create_default_token(None, False, False)
     assert token1
     assert token_path.read_text(encoding="utf-8").strip() == token1
-    token2 = server_module._load_or_create_default_token(None, False, False)
+    token2 = cli_module.load_or_create_default_token(None, False, False)
     assert token2 == token1  # reused across "launches", not regenerated
 
 
 def test_regenerate_flag_produces_and_persists_a_new_value(tmp_path, monkeypatch):
     token_path = tmp_path / "token"
     monkeypatch.setenv("GRIDSHELL_TOKEN_PATH", str(token_path))
-    token1 = server_module._load_or_create_default_token(None, False, False)
-    token2 = server_module._load_or_create_default_token(None, False, True)
+    token1 = cli_module.load_or_create_default_token(None, False, False)
+    token2 = cli_module.load_or_create_default_token(None, False, True)
     assert token2 != token1
     assert token_path.read_text(encoding="utf-8").strip() == token2
 
@@ -1368,14 +1492,14 @@ def test_regenerate_flag_produces_and_persists_a_new_value(tmp_path, monkeypatch
 def test_no_auth_token_flag_disables_default_generation(tmp_path, monkeypatch):
     token_path = tmp_path / "token"
     monkeypatch.setenv("GRIDSHELL_TOKEN_PATH", str(token_path))
-    assert server_module._load_or_create_default_token(None, True, False) is None
+    assert cli_module.load_or_create_default_token(None, True, False) is None
     assert not token_path.exists()
 
 
 def test_explicit_token_is_returned_unchanged_and_not_persisted(tmp_path, monkeypatch):
     token_path = tmp_path / "token"
     monkeypatch.setenv("GRIDSHELL_TOKEN_PATH", str(token_path))
-    assert server_module._load_or_create_default_token("mine", False, False) == "mine"
+    assert cli_module.load_or_create_default_token("mine", False, False) == "mine"
     assert not token_path.exists()
 
 
@@ -1390,9 +1514,9 @@ def test_fresh_token_with_no_clipboard_still_starts(tmp_path, monkeypatch, capsy
     token_path = tmp_path / "token"
     monkeypatch.setenv("GRIDSHELL_TOKEN_PATH", str(token_path))
     monkeypatch.setattr(sys, "argv", ["gridshell-server"])
-    monkeypatch.setattr(server_module, "_try_clipboard_copy", lambda text: False)
-    flags = server_module.resolve_flags()
-    token = flags[6]
+    monkeypatch.setattr(cli_module, "try_clipboard_copy", lambda text: False)
+    flags = cli_module.resolve_flags()
+    token = flags.auth_token
     assert token
     assert token_path.read_text(encoding="utf-8").strip() == token
     out = capsys.readouterr().out
@@ -1403,20 +1527,20 @@ def test_fresh_token_with_no_clipboard_still_starts(tmp_path, monkeypatch, capsy
 def test_token_persist_failure_with_no_clipboard_refuses_to_start(tmp_path, monkeypatch):
     monkeypatch.setenv("GRIDSHELL_TOKEN_PATH", str(tmp_path / "token"))
     monkeypatch.setattr(sys, "argv", ["gridshell-server"])
-    monkeypatch.setattr(server_module, "_try_clipboard_copy", lambda text: False)
-    monkeypatch.setattr(server_module, "_load_or_create_default_token", lambda *a, **k: "in-memory-only")
-    monkeypatch.setattr(server_module, "_persisted_token_exists", lambda: False)
+    monkeypatch.setattr(cli_module, "try_clipboard_copy", lambda text: False)
+    monkeypatch.setattr(cli_module, "load_or_create_default_token", lambda *a, **k: "in-memory-only")
+    monkeypatch.setattr(cli_module, "persisted_token_exists", lambda: False)
     with pytest.raises(SystemExit) as exc_info:
-        server_module.resolve_flags()
+        cli_module.resolve_flags()
     assert "retry" in str(exc_info.value).lower()
 
 
 def test_fresh_token_with_clipboard_prints_confirmation_not_the_value(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("GRIDSHELL_TOKEN_PATH", str(tmp_path / "token"))
     monkeypatch.setattr(sys, "argv", ["gridshell-server"])
-    monkeypatch.setattr(server_module, "_try_clipboard_copy", lambda text: True)
-    flags = server_module.resolve_flags()
-    token = flags[6]
+    monkeypatch.setattr(cli_module, "try_clipboard_copy", lambda text: True)
+    flags = cli_module.resolve_flags()
+    token = flags.auth_token
     assert token
     out = capsys.readouterr().out
     assert token not in out
@@ -1426,11 +1550,11 @@ def test_fresh_token_with_clipboard_prints_confirmation_not_the_value(tmp_path, 
 def test_reused_token_with_no_clipboard_still_starts(tmp_path, monkeypatch, capsys):
     token_path = tmp_path / "token"
     monkeypatch.setenv("GRIDSHELL_TOKEN_PATH", str(token_path))
-    existing = server_module._load_or_create_default_token(None, False, False)
+    existing = cli_module.load_or_create_default_token(None, False, False)
     monkeypatch.setattr(sys, "argv", ["gridshell-server"])
-    monkeypatch.setattr(server_module, "_try_clipboard_copy", lambda text: False)
-    flags = server_module.resolve_flags()
-    assert flags[6] == existing
+    monkeypatch.setattr(cli_module, "try_clipboard_copy", lambda text: False)
+    flags = cli_module.resolve_flags()
+    assert flags.auth_token == existing
     out = capsys.readouterr().out
     assert existing not in out
     assert "clipboard unavailable" in out.lower()
@@ -1439,20 +1563,20 @@ def test_reused_token_with_no_clipboard_still_starts(tmp_path, monkeypatch, caps
 def test_explicit_token_never_touches_clipboard(monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", ["gridshell-server", "--auth-token", "mine"])
     monkeypatch.setattr(
-        server_module, "_try_clipboard_copy",
+        cli_module, "try_clipboard_copy",
         lambda text: (_ for _ in ()).throw(AssertionError("should not be called")),
     )
-    flags = server_module.resolve_flags()
-    assert flags[6] == "mine"
+    flags = cli_module.resolve_flags()
+    assert flags.auth_token == "mine"
     assert "mine" not in capsys.readouterr().out
 
 
 def test_copy_token_flag_success_exits_zero_without_printing_value(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("GRIDSHELL_TOKEN_PATH", str(tmp_path / "token"))
     monkeypatch.setattr(sys, "argv", ["gridshell-server", "--copy-token"])
-    monkeypatch.setattr(server_module, "_try_clipboard_copy", lambda text: True)
+    monkeypatch.setattr(cli_module, "try_clipboard_copy", lambda text: True)
     with pytest.raises(SystemExit) as exc_info:
-        server_module.resolve_flags()
+        cli_module.resolve_flags()
     assert exc_info.value.code == 0
     out = capsys.readouterr().out
     assert "copied to clipboard" in out.lower()
@@ -1461,47 +1585,46 @@ def test_copy_token_flag_success_exits_zero_without_printing_value(tmp_path, mon
 def test_copy_token_flag_no_clipboard_exits_nonzero(tmp_path, monkeypatch):
     monkeypatch.setenv("GRIDSHELL_TOKEN_PATH", str(tmp_path / "token"))
     monkeypatch.setattr(sys, "argv", ["gridshell-server", "--copy-token"])
-    monkeypatch.setattr(server_module, "_try_clipboard_copy", lambda text: False)
+    monkeypatch.setattr(cli_module, "try_clipboard_copy", lambda text: False)
     with pytest.raises(SystemExit) as exc_info:
-        server_module.resolve_flags()
+        cli_module.resolve_flags()
     assert exc_info.value.code != 0
 
 
 def test_copy_token_flag_with_no_auth_token_exits_nonzero(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["gridshell-server", "--copy-token", "--no-auth-token"])
     with pytest.raises(SystemExit) as exc_info:
-        server_module.resolve_flags()
+        cli_module.resolve_flags()
     assert exc_info.value.code != 0
 
 
 def test_try_clipboard_copy_respects_no_clipboard_test_seam(monkeypatch):
     monkeypatch.setenv("GRIDSHELL_NO_CLIPBOARD", "1")
-    assert server_module._try_clipboard_copy("anything") is False
+    assert cli_module.try_clipboard_copy("anything") is False
 
 
 # ── Root/Administrator refusal guard ──────────────────────────────────────
 
 def test_refuses_to_start_as_root_without_allow_root(monkeypatch):
-    monkeypatch.setattr(server_module, "_running_as_root_or_admin", lambda: True)
+    monkeypatch.setattr(app_module, "_running_as_root_or_admin", lambda: True)
     with pytest.raises(SystemExit) as exc_info:
-        asyncio.run(server_module.main(
+        asyncio.run(app_module.main(app_module.Settings(
             port=0, idle_hours=12, buffer_mb=8, cert_path=None, key_path=None,
-            use_wss=False, auth_token="tok", host="localhost", allow_origins=[],
+            use_wss=False, auth_token="tok", host="localhost", allow_origins=(),
             max_message_mb=None, allow_root=False,
-        ))
+        )))
     assert "root" in str(exc_info.value).lower() or "administrator" in str(exc_info.value).lower()
 
 
 def test_starts_as_root_with_allow_root(monkeypatch):
-    monkeypatch.setattr(server_module, "_running_as_root_or_admin", lambda: True)
-    monkeypatch.setattr(server_module, "PtyProcess", FakePtyProcess)
+    monkeypatch.setattr(app_module, "_running_as_root_or_admin", lambda: True)
 
     async def run_and_stop():
-        task = asyncio.ensure_future(server_module.main(
+        task = asyncio.ensure_future(app_module.main(app_module.Settings(
             port=0, idle_hours=12, buffer_mb=8, cert_path=None, key_path=None,
-            use_wss=False, auth_token="tok", host="localhost", allow_origins=[],
+            use_wss=False, auth_token="tok", host="localhost", allow_origins=(),
             max_message_mb=None, allow_root=True,
-        ))
+        )))
         await asyncio.sleep(0.2)
         assert not task.done()  # still running - didn't exit/raise
         task.cancel()
@@ -1524,3 +1647,71 @@ def test_mcp_sole_connected_client_fallback_needs_no_session_key(server):
     response = json.loads(mcp_ws.recv(timeout=3))
     assert_valid(RESPONSE_ENVELOPE_SCHEMA, response, "/mcp response envelope")
     assert response["result"] == "fallback-ok"
+
+
+def test_spawned_shell_gets_the_session_id_and_a_session_key_in_its_env(server, monkeypatch):
+    seen = {}
+
+    class EnvCapturingPty(FakePtyProcess):
+        @classmethod
+        def spawn(cls, *args, **kwargs):
+            seen["env"] = kwargs.get("env")
+            return cls()
+
+    monkeypatch.setattr(server.terminal_hub, "spawn_fn", EnvCapturingPty.spawn)
+    client = TerminalClient(server.connect("/terminal", auth={"session": "env-test"}))
+    client.send({"type": "resize", "cols": 80, "rows": 24})
+    client.wait_for_type("spawned")
+    assert seen["env"]["GRIDSHELL_SESSION"] == "env-test"
+    key = seen["env"]["GRIDSHELL_SESSION_KEY"]
+    assert isinstance(key, str) and len(key) >= 32
+
+
+def test_shutdown_hook_helper_terminates_every_live_shell(server):
+    client = TerminalClient(server.connect("/terminal", auth={"session": "kill-all"}))
+    client.send({"type": "resize", "cols": 80, "rows": 24})
+    client.wait_for_type("spawned")
+    assert not FakePtyProcess.instances[0].killed
+    app_module._kill_all_sessions(server.terminal_hub)
+    assert FakePtyProcess.instances[0].killed is True
+    assert not server.terminal_hub.table.sessions
+    # The shell's exit must not kill it again (Windows answers the second call
+    # with "access denied").
+    time.sleep(0.5)
+    assert FakePtyProcess.instances[0].terminate_calls == 1
+
+
+def test_buffer_mb_param_of_zero_means_no_override_and_the_session_still_works(server):
+    client = TerminalClient(server.connect("/terminal?bufferMb=0", auth={"session": "zero-buf"}))
+    client.send({"type": "resize", "cols": 80, "rows": 24})
+    client.wait_for_type("spawned")
+    client.send({"type": "input", "data": "still-alive"})
+    client.wait_for(
+        lambda m: m.get("type") == "output" and m.get("data") == "still-alive",
+        description='output "still-alive"',
+    )
+    assert server.terminal_hub.table.sessions["zero-buf"].replay.max_bytes == 8 * 1024 * 1024
+
+
+def test_connection_closed_log_says_why_and_host_retry_is_not_logged(server, capsys):
+    host = server.connect("/host", auth={"session": "why-test", "hostKey": "hk-why"})
+    with pytest.raises(Exception):
+        host.recv(timeout=2)  # 1013, the sidebar retries
+    auth = {"session": "why-test", "hostKey": "hk-why"}
+    first = TerminalClient(server.connect("/terminal", auth=auth))
+    first.send({"type": "resize", "cols": 80, "rows": 24})
+    first.wait_for_type("spawned")
+    second = TerminalClient(server.connect("/terminal", auth=auth))
+    second.wait_for_type("attached")
+    second.send({"type": "terminate"})
+    second.wait_for_type("terminated")
+    seen = []
+
+    def logged(text):
+        seen.append(capsys.readouterr().out)
+        return text in "".join(seen)
+
+    wait_until(lambda: logged("connection closed (evicted by a newer connection)"))
+    out = "".join(seen)
+    assert "connection closed (evicted by a newer connection)" in out
+    assert "closing so the sidebar retries" not in out

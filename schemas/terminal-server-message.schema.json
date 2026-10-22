@@ -70,11 +70,13 @@
     },
     {
       "title": "hello",
-      "description": "Only sent to a client that declared the `hello` capability. Sent immediately before `spawned` or `attached`, so a client that has seen `spawned`/`attached` without a `hello` knows it is talking to a server older than this message. `protocol` is an integer the server raises only when a release brings a change that clients' users should be nudged to update for. A client may compare it against the lowest level it considers current.",
+      "description": "Only sent to a client that declared the `hello` capability. Sent immediately before `spawned` or `attached`, so a client that has seen `spawned`/`attached` without a `hello` knows it is talking to a server older than this message. `protocol` is an integer the server raises only when a release brings a change that clients' users should be nudged to update for. A client may compare it against the lowest level it considers current. On a Windows server `pty` is `conpty` and `build` the Windows build number, so a client can match its terminal emulator to ConPTY's resize behavior; both are absent elsewhere.",
       "type": "object",
       "properties": {
         "type": { "const": "hello" },
-        "protocol": { "type": "integer", "minimum": 1 }
+        "protocol": { "type": "integer", "minimum": 1 },
+        "pty": { "const": "conpty" },
+        "build": { "type": "integer", "minimum": 1 }
       },
       "required": ["type", "protocol"],
       "additionalProperties": false

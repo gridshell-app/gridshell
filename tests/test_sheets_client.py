@@ -21,9 +21,9 @@ def _fake_handler(behaviors):
 
     def handler(ws):
         # First message on every connection is the auth frame
-        # (see server.py's router() comment) and not a tool call, so it's
+        # (see create_app's router) and not a tool call, so it's
         # consumed and discarded here before the real request/response
-        # loop starts, matching what a real server.py connection now does.
+        # loop starts, matching what a real server connection now does.
         try:
             ws.recv()
         except Exception:
@@ -48,7 +48,7 @@ def fake_server():
     servers = []
 
     def start(behaviors):
-        server = serve(_fake_handler(behaviors), "localhost", 0)
+        server = serve(_fake_handler(behaviors), "127.0.0.1", 0)
         servers.append(server)
         port = server.socket.getsockname()[1]
         thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -72,12 +72,12 @@ def test_token_rejection_surfaces_the_documented_message():
             return
         ws.close(code=1008, reason="invalid or missing token")
 
-    server = serve(handler, "localhost", 0)
+    server = serve(handler, "127.0.0.1", 0)
     port = server.socket.getsockname()[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        grid = SheetsClient(port=port, default_timeout=2)
+        grid = SheetsClient(host="127.0.0.1", port=port, default_timeout=2)
         with pytest.raises(GridShellConnectionError, match="Rejected by the server: invalid or missing token"):
             grid.get_values("A1:B2")
     finally:
@@ -86,7 +86,7 @@ def test_token_rejection_surfaces_the_documented_message():
 
 def test_get_values_explicit_range(fake_server):
     port = fake_server({"getValues": [[1, 2], [3, 4]]})
-    grid = SheetsClient(port=port, default_timeout=2)
+    grid = SheetsClient(host="127.0.0.1", port=port, default_timeout=2)
     try:
         assert grid.get_values("A1:B2") == [[1, 2], [3, 4]]
     finally:
@@ -101,7 +101,7 @@ def test_get_values_selection_routes_through_run_batch(fake_server):
         return {"status": "complete", "completed": 1, "total": 1, "results": [{"ok": True, "value": [["selected"]]}]}
 
     port = fake_server({"runBatch": run_batch})
-    grid = SheetsClient(port=port, default_timeout=2)
+    grid = SheetsClient(host="127.0.0.1", port=port, default_timeout=2)
     try:
         assert grid.get_values() == [["selected"]]
     finally:
@@ -122,7 +122,7 @@ def test_get_values_selection_raises_on_partial_batch(fake_server):
             }
         }
     )
-    grid = SheetsClient(port=port, default_timeout=2)
+    grid = SheetsClient(host="127.0.0.1", port=port, default_timeout=2)
     try:
         with pytest.raises(GridShellError, match="Nothing is selected"):
             grid.get_values()
@@ -137,7 +137,7 @@ def test_set_values_selection_handles_missing_value_key(fake_server):
     port = fake_server(
         {"runBatch": {"status": "complete", "completed": 1, "total": 1, "results": [{"ok": True}]}}
     )
-    grid = SheetsClient(port=port, default_timeout=2)
+    grid = SheetsClient(host="127.0.0.1", port=port, default_timeout=2)
     try:
         grid.set_values([["hello"]])  # must not raise KeyError
     finally:
@@ -146,7 +146,7 @@ def test_set_values_selection_handles_missing_value_key(fake_server):
 
 def test_get_values_selection_rejects_sheet_arg(fake_server):
     port = fake_server({})
-    grid = SheetsClient(port=port, default_timeout=2)
+    grid = SheetsClient(host="127.0.0.1", port=port, default_timeout=2)
     try:
         with pytest.raises(ValueError):
             grid.get_values(sheet="Sheet2")
@@ -166,7 +166,7 @@ def test_set_values_and_append_row(fake_server):
         return None
 
     port = fake_server({"setValues": set_values, "appendRow": append_row})
-    grid = SheetsClient(port=port, default_timeout=2)
+    grid = SheetsClient(host="127.0.0.1", port=port, default_timeout=2)
     try:
         grid.set_values([[1, 2]], range="A1:B1", sheet="Data")
         grid.append_row([1, 2, 3], sheet="Data")
@@ -180,7 +180,7 @@ def test_append_row_rejects_nested_list(fake_server):
     # Regression test: append_row([[3, 4]]) used to silently write
     # "[Ljava.lang.Object;@..." instead of erroring.
     port = fake_server({})
-    grid = SheetsClient(port=port, default_timeout=2)
+    grid = SheetsClient(host="127.0.0.1", port=port, default_timeout=2)
     try:
         with pytest.raises(ValueError, match="flat list"):
             grid.append_row([[3, 4]])
@@ -194,7 +194,7 @@ def test_append_row_rejects_bare_string(fake_server):
     # element of a string is itself a list/tuple) and gets sent to the wire
     # as a bare string where an array is expected.
     port = fake_server({})
-    grid = SheetsClient(port=port, default_timeout=2)
+    grid = SheetsClient(host="127.0.0.1", port=port, default_timeout=2)
     try:
         with pytest.raises(ValueError, match="not a list of values"):
             grid.append_row("hello")
@@ -209,7 +209,7 @@ def test_set_values_rejects_bare_string(fake_server):
     # flat-list acceptance didn't distinguish a real flat list from a
     # string being iterated character-by-character.
     port = fake_server({})
-    grid = SheetsClient(port=port, default_timeout=2)
+    grid = SheetsClient(host="127.0.0.1", port=port, default_timeout=2)
     try:
         with pytest.raises(ValueError, match="not a list of values"):
             grid.set_values("hello from python", range="A1")
@@ -225,7 +225,7 @@ def test_set_values_accepts_flat_list_as_one_row(fake_server):
         return None
 
     port = fake_server({"setValues": set_values})
-    grid = SheetsClient(port=port, default_timeout=2)
+    grid = SheetsClient(host="127.0.0.1", port=port, default_timeout=2)
     try:
         grid.set_values([1, 2, 3], range="A1:C1")
     finally:
@@ -235,7 +235,7 @@ def test_set_values_accepts_flat_list_as_one_row(fake_server):
 
 def test_set_values_rejects_mixed_shape(fake_server):
     port = fake_server({})
-    grid = SheetsClient(port=port, default_timeout=2)
+    grid = SheetsClient(host="127.0.0.1", port=port, default_timeout=2)
     try:
         with pytest.raises(ValueError, match="mix of rows"):
             grid.set_values([1, [2, 3]], range="A1:B1")
@@ -245,7 +245,7 @@ def test_set_values_rejects_mixed_shape(fake_server):
 
 def test_server_error_raises_gridshell_error(fake_server):
     port = fake_server({"getValues": "error:Blocked by deny list"})
-    grid = SheetsClient(port=port, default_timeout=2)
+    grid = SheetsClient(host="127.0.0.1", port=port, default_timeout=2)
     try:
         with pytest.raises(GridShellError, match="Blocked by deny list"):
             grid.get_values("A1:B2")
@@ -255,7 +255,7 @@ def test_server_error_raises_gridshell_error(fake_server):
 
 def test_call_escape_hatch_reaches_unlisted_tool(fake_server):
     port = fake_server({"someNewTool": {"ok": True}})
-    grid = SheetsClient(port=port, default_timeout=2)
+    grid = SheetsClient(host="127.0.0.1", port=port, default_timeout=2)
     try:
         assert grid.call("someNewTool", {"x": 1}) == {"ok": True}
     finally:
@@ -286,7 +286,7 @@ def test_no_session_and_no_env_var_sends_empty_session(monkeypatch):
 def test_url_never_carries_session_or_token(monkeypatch):
     # Credentials travel as the first message on the connection
     # (see connect()/_connect_auth), never in the URL. A reverse proxy in
-    # front of server.py logs the full request line by default, which
+    # front of the server logs the full request line by default, which
     # would put a shared secret (or the session id) in plain text in the
     # proxy's access log.
     monkeypatch.delenv("GRIDSHELL_SESSION", raising=False)
@@ -303,7 +303,7 @@ def test_no_token_sends_empty_string_in_auth_frame():
 
 def test_token_has_no_auth_token_env_var_fallback(monkeypatch):
     # Unlike GRIDSHELL_AUTH_TOKEN (below), a plain AUTH_TOKEN (the env var
-    # server.py itself reads to configure its own required token) isn't
+    # the server itself reads to configure its own required token) isn't
     # meant to be picked up client-side. A script running next to a
     # server it isn't targeting shouldn't silently inherit that server's
     # own config var.
@@ -314,7 +314,7 @@ def test_token_has_no_auth_token_env_var_fallback(monkeypatch):
 
 
 def test_token_defaults_from_gridshell_auth_token_env_var(monkeypatch):
-    # Set by server.py in a spawned shell's environment alongside
+    # Set by the server in a spawned shell's environment alongside
     # GRIDSHELL_SESSION/GRIDSHELL_SESSION_KEY whenever a token is
     # configured - lets a script run from inside that shell authenticate
     # with zero manual configuration, same pattern as session.
@@ -331,7 +331,7 @@ def test_explicit_token_overrides_env_var(monkeypatch):
 
 def test_timeout_raises_gridshell_timeout_error(fake_server):
     port = fake_server({"getValues": "timeout"})
-    grid = SheetsClient(port=port, default_timeout=0.2)
+    grid = SheetsClient(host="127.0.0.1", port=port, default_timeout=0.2)
     try:
         with pytest.raises(GridShellTimeoutError):
             grid.get_values("A1:B2")
@@ -347,7 +347,7 @@ def test_fetches_batch_time_budget_once_on_connect(fake_server):
         return 4500
 
     port = fake_server({"getBatchTimeBudgetMs": budget, "getValues": [[1]]})
-    grid = SheetsClient(port=port, default_timeout=2)
+    grid = SheetsClient(host="127.0.0.1", port=port, default_timeout=2)
     try:
         grid.get_values("A1")
         grid.get_values("A1")

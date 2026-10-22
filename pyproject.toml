@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gridshell"
-version = "1.0.0b4"
+version = "1.0.0b5"
 description = "Self-hosted terminal-server + MCP relay + Python client for driving a live, open Google Sheets spreadsheet from an AI CLI agent or a script."
 readme = "README.md"
 license = "MIT"
@@ -28,7 +28,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "jsonschema>=4.0"]
+dev = ["pytest>=8.0", "jsonschema>=4.0", "ruff>=0.5"]
 
 [project.scripts]
 gridshell-server = "gridshell.server:run"
@@ -42,3 +42,17 @@ Issues = "https://github.com/gridshell-app/gridshell/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+# pycodestyle, pyflakes, import order, pyupgrade, bugbear
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# The MCP tool descriptions are long prose strings, wrapping them hurts more than it helps.
+"src/gridshell/mcp_grid.py" = ["E501"]
+# Deliberate in tests: broad pytest.raises, printf-style messages, long literals.
+"tests/*" = ["B017", "E501", "UP031"]
