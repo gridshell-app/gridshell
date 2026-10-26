@@ -144,6 +144,6 @@ pytest
 
 This package (`gridshell`) is the backend for the GridShell Sheets add-on, and is open source under the [MIT License](LICENSE) - so you can read exactly what it does, adapt it to your own security requirements, or build your own tools on top of it. The add-on itself, distributed only through the Google Workspace Marketplace, is a separate, closed-source component not included in this repository - see [License](https://gridshell.app/legal/license/) for its terms. See [Contributing](CONTRIBUTING.md) before opening a pull request, and [Security Policy](SECURITY.md) to report a vulnerability privately.
 
-GridShell is provided as-is, with no warranty of any kind - see the [Terms of Service](https://gridshell.app/legal/terms-of-service/) for the full terms. Full documentation, including the Sheets add-on side: [docs-site](https://gridshell.app/).
+GridShell is provided as-is, with no warranty of any kind - see the [Terms of Service](https://gridshell.app/legal/terms-of-service/) for the full terms. Full documentation, including the Sheets add-on side: [docs-site](https://gridshell.app/). Questions and feedback are welcome in [GitHub Discussions](https://github.com/gridshell-app/gridshell/discussions); bugs and feature requests go to [Issues](https://github.com/gridshell-app/gridshell/issues).
 
 Code of conduct is pending - not yet drafted.
