@@ -1,6 +1,12 @@
 # gridshell
 
-Everything needed to self-host a [GridShell](https://gridshell.app) backend and drive a live, open Google Sheets spreadsheet from Python or an AI CLI agent, in one `pip install`:
+Run your own CLI coding agent from inside Google Sheets. [GridShell](https://gridshell.app) puts a real terminal in a sheet sidebar, so you start the agent there, watch it work on the spreadsheet you have open, and type to it in the same place. It can act on your current selection as well as on named ranges, which makes it easy to build a sheet step by step.
+
+- **Authorization goes through the add-on** you install from the [Google Workspace Marketplace](https://workspace.google.com/marketplace/app/gridshell/656676222795), so no separate authorization credentials are required. An agent can access only your current spreadsheet.
+- **You run the server yourself**, on your own machine or infrastructure. Spreadsheet data goes between your browser, your server and your agent, and never through the developer's servers.
+- **For terminal-based (CLI) agents** that run inside the GridShell terminal. It is not designed for desktop or web chat apps.
+
+This package is the server side; the add-on is installed separately. Everything needed to self-host a GridShell backend and drive a live, open Google Sheets spreadsheet from Python or an AI CLI agent, in one `pip install`:
 
 - **`gridshell-server`**: the terminal-server itself: a PTY + Sheets bridge + MCP relay, spoken over plain WebSocket (`/terminal`, `/host`, `/mcp`).
 - **`gridshell-mcp`**: an MCP stdio server that relays tool calls to a running `gridshell-server`'s `/mcp` endpoint. Register this with any MCP-compatible agent (Claude Code, Antigravity, Codex, OpenCode, etc.).
